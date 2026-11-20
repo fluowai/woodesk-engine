@@ -1,0 +1,342 @@
+import {
+  aiTimeouts,
+  helpTexts,
+  processStreamingText,
+  toolPrefixes,
+  toStepSeparatedTextStream,
+} from "@chatbotx.io/ai"
+import {
+  aiContextService,
+  aiIntegrationService,
+  appendFabricationGuard,
+  appendKnowledgeBaseGuard,
+  appendToolOutputGuard,
+  createAIModelInstance,
+  createOpenaiCompatibleModelInstance,
+  getAIToolset,
+  McpClient,
+  normalizeMcpContent,
+} from "@chatbotx.io/ai/server"
+import { integrationOpenaiCompatibleService } from "@chatbotx.io/business"
+import type {
+  AIAgentModelConfig,
+  AIAgentOpenaiCompatibleProviderModel,
+  AIAgentProvider,
+  AIAgentProviderModel,
+  AIAgentProviderModels,
+} from "@chatbotx.io/database/partials"
+import type {
+  AIAgentModel,
+  ContactInboxModel,
+  ConversationModel,
+} from "@chatbotx.io/database/types"
+import { contactVariableService } from "@chatbotx.io/variables"
+import { isStepCount, type ModelMessage, streamText, type ToolSet } from "ai"
+import { normalizeError } from "universal-error-normalizer"
+import { logger } from "../../../lib/logger"
+import {
+  type AgentToolStats,
+  createAgentToolStatsCollector,
+} from "./agent-tool-stats"
+import { logProviderAttempt } from "./provider-attempt-logger"
+import { createMcpTokenResolver } from "./resolve-mcp-token"
+
+export type ReplyByAIProps = {
+  conversation: ConversationModel
+  contactInbox: ContactInboxModel
+  messages: ModelMessage[]
+  aiAgent: AIAgentModel
+  summary?: string
+  preferredProvider?: AIAgentProvider
+  preferredModel?: AIAgentModelConfig
+  /** The inbox user who sent the running flow, for `{{admin_name}}` in the prompt. */
+  sentByUserId?: string
+}
+
+export type ReplyByAIExecutionResult = {
+  responded: boolean
+  provider: AIAgentProvider | "openaiCompatible"
+  modelId: string
+  usedFallbackText: boolean
+  fullText: string
+  toolStats: AgentToolStats
+}
+
+export async function runAIAgentRunner(
+  props: ReplyByAIProps,
+): Promise<null | ReplyByAIExecutionResult> {
+  const { aiAgent, preferredModel, preferredProvider } = props
+  const providers = aiAgent.models as AIAgentProviderModels
+  let providersToRun = providers
+
+  if (preferredModel) {
+    providersToRun = [preferredModel]
+  } else if (preferredProvider) {
+    providersToRun = providers.filter(
+      (providerInfo) =>
+        isNativeProviderModel(providerInfo) &&
+        providerInfo.provider === preferredProvider,
+    )
+  }
+
+  const { tools, cleanup } = await getAIToolset({
+    workspaceId: aiAgent.workspaceId,
+    tools: aiAgent.tools,
+    toolPrefixes: {
+      file: toolPrefixes.enum.file,
+      fn: toolPrefixes.enum.fn,
+      mcp: toolPrefixes.enum.mcp,
+      sys: toolPrefixes.enum.sys,
+    },
+    fileSearch: {
+      fileSearchDescription: helpTexts.fileSearchDescription,
+      fileSearchQueryDescription: helpTexts.fileSearchQueryDescription,
+      fileSearchNoResult: helpTexts.fileSearchNoResult,
+      fileSearchFoundPrefix: helpTexts.fileSearchFoundPrefix,
+    },
+    mcp: {
+      McpClient,
+      normalizeMcpContent,
+      resolveToken: createMcpTokenResolver(props.conversation.workspaceId),
+    },
+  })
+
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), aiTimeouts.aiTotal)
+
+  try {
+    for (const [index, providerInfo] of providersToRun.entries()) {
+      const attemptStartedAt = Date.now()
+      const result = await runAIReplyInternal(
+        props,
+        providerInfo,
+        tools,
+        controller.signal,
+      )
+      const durationMs = Date.now() - attemptStartedAt
+      logProviderAttempt(
+        logger,
+        durationMs,
+        {
+          conversationId: props.conversation.id,
+          workspaceId: props.conversation.workspaceId,
+          agentId: props.aiAgent.id,
+          provider: getProviderName(providerInfo),
+          providerIndex: index,
+          providerCount: providersToRun.length,
+          durationMs,
+          responded: Boolean(result?.responded),
+        },
+        "[ai-agent-runner] fallback chain provider attempt",
+      )
+      if (result?.responded) {
+        return result
+      }
+    }
+  } finally {
+    clearTimeout(timeoutId)
+    await cleanup()
+  }
+
+  return null
+}
+
+async function runAIReplyInternal(
+  props: ReplyByAIProps,
+  providerInfo: AIAgentModelConfig,
+  tools: ToolSet,
+  abortSignal: AbortSignal,
+): Promise<null | ReplyByAIExecutionResult> {
+  const { conversation, messages, aiAgent } = props
+  const provider = getProviderName(providerInfo)
+  try {
+    const selectedModelId = providerInfo.model
+    const model = await createAgentModel({
+      conversationId: conversation.id,
+      providerInfo,
+      workspaceId: conversation.workspaceId,
+    })
+
+    if (!model) {
+      return null
+    }
+
+    const variables = await contactVariableService.getAll({
+      contactId: conversation.contactId,
+      contactInbox: props.contactInbox,
+      conversation,
+      sentByUserId: props.sentByUserId,
+    })
+    const promptBase = aiAgent.prompt
+      ? await contactVariableService.replaceAll({
+          text: aiAgent.prompt,
+          variables,
+        })
+      : ""
+    const completePrompt = props.summary
+      ? `Conversation Context: ${props.summary}\n\n${promptBase}`
+      : promptBase
+
+    const systemPrompt = appendKnowledgeBaseGuard(
+      appendFabricationGuard(appendToolOutputGuard(completePrompt), tools),
+      tools,
+    )
+
+    const toolStats = createAgentToolStatsCollector({
+      conversationId: conversation.id,
+      logPrefix: "ai-agent-runner",
+      modelId: selectedModelId,
+      provider,
+      workspaceId: conversation.workspaceId,
+    })
+
+    const hasTools = Object.keys(tools).length > 0
+    const result = await streamText({
+      model,
+      instructions: systemPrompt,
+      messages,
+      maxOutputTokens: aiAgent.maxOutputTokens,
+      temperature: aiAgent.temperature,
+      tools,
+      toolChoice: hasTools ? "auto" : "none",
+      stopWhen: isStepCount(5),
+      timeout: {
+        totalMs: aiTimeouts.aiTotal,
+        stepMs: aiTimeouts.aiStep,
+        firstChunkMs: aiTimeouts.aiFirstChunk,
+        chunkMs: aiTimeouts.aiChunk,
+      },
+      onStepEnd: toolStats.onStepEnd,
+      onToolExecutionEnd: toolStats.onToolExecutionEnd,
+      abortSignal,
+    })
+
+    const { fullText } = await processStreamingText(
+      toStepSeparatedTextStream(result.stream),
+      async () => {
+        // noop: fullText is accumulated internally, no message to send
+      },
+      { sendParts: false },
+    ).catch((streamError) => {
+      const normalizedError = normalizeError(streamError)
+      logger.error(
+        {
+          err: normalizedError,
+          provider,
+          modelId: selectedModelId,
+          conversationId: conversation.id,
+        },
+        "[ai-agent-runner] processStreamingText threw error",
+      )
+      return { fullText: "" }
+    })
+
+    if (fullText) {
+      await aiContextService.appendHistory({
+        conversationId: conversation.id,
+        newMessages: [
+          {
+            message: {
+              role: "assistant",
+              content: fullText,
+            },
+            createdAt: Date.now(),
+          },
+        ],
+      })
+
+      return {
+        responded: true,
+        provider,
+        modelId: selectedModelId,
+        usedFallbackText: false,
+        fullText,
+        toolStats: toolStats.toToolStats(),
+      }
+    }
+
+    if (toolStats.hasToolActivity()) {
+      return {
+        responded: true,
+        provider,
+        modelId: selectedModelId,
+        usedFallbackText: true,
+        fullText: helpTexts.fallbackLookup,
+        toolStats: toolStats.toToolStats(),
+      }
+    }
+
+    return null
+  } catch (error) {
+    const normalizedError = normalizeError(error)
+    logger.error(
+      {
+        err: normalizedError,
+        provider,
+        conversationId: conversation.id,
+        workspaceId: conversation.workspaceId,
+      },
+      "[ai-agent-runner] runAIReplyInternal failed",
+    )
+    return null
+  }
+}
+
+async function createAgentModel(props: {
+  conversationId: string
+  providerInfo: AIAgentModelConfig
+  workspaceId: string
+}) {
+  const { conversationId, providerInfo, workspaceId } = props
+
+  if (isOpenaiCompatibleProviderModel(providerInfo)) {
+    const integration =
+      await integrationOpenaiCompatibleService.findByWorkspaceIdAndId({
+        workspaceId,
+        id: providerInfo.integrationId,
+      })
+
+    if (!integration?.enabled) {
+      return null
+    }
+
+    return createOpenaiCompatibleModelInstance({
+      integration,
+      modelId: providerInfo.model,
+    })
+  }
+
+  const integration = await aiIntegrationService.findBy({
+    workspaceId,
+    provider: providerInfo.provider,
+  })
+
+  if (!integration) {
+    return null
+  }
+
+  return createAIModelInstance({
+    model: integration,
+    provider: providerInfo.provider,
+    modelId: providerInfo.model,
+    traceId: conversationId,
+  })
+}
+
+function isNativeProviderModel(
+  providerInfo: AIAgentModelConfig,
+): providerInfo is AIAgentProviderModel {
+  return "provider" in providerInfo
+}
+
+function isOpenaiCompatibleProviderModel(
+  providerInfo: AIAgentModelConfig,
+): providerInfo is AIAgentOpenaiCompatibleProviderModel {
+  return "kind" in providerInfo && providerInfo.kind === "openaiCompatible"
+}
+
+function getProviderName(providerInfo: AIAgentModelConfig) {
+  return isOpenaiCompatibleProviderModel(providerInfo)
+    ? "openaiCompatible"
+    : providerInfo.provider
+}

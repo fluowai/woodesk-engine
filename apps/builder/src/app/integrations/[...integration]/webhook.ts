@@ -1,0 +1,726 @@
+import {
+  connectionStateService,
+  customDomainService,
+  lineIntegrationService,
+  platformCredentialService,
+  tenantService,
+  workspaceMemberService,
+} from "@chatbotx.io/business"
+import { IntegrationNotFoundError } from "@chatbotx.io/channel-registry/errors"
+import { integrationService } from "@chatbotx.io/channel-registry/registry"
+import type {
+  IntegrationType,
+  ProviderAccountRouteScope,
+} from "@chatbotx.io/database/partials"
+import { getSafeErrorDetails } from "@chatbotx.io/integration-threads"
+import type {
+  TiktokAuthValue,
+  TiktokConfig,
+} from "@chatbotx.io/integration-tiktok"
+import { type ContextQueue, SdkException } from "@chatbotx.io/sdk"
+import {
+  IntegrationJobAction,
+  integrationQueue,
+} from "@chatbotx.io/worker-config"
+import type { NextRequest } from "next/server"
+import { isCloud } from "@/env"
+import { findIntegrationTelegramByBotId } from "@/features/integration-telegram/queries"
+import { findIntegrationTiktokByOpenId } from "@/features/integration-tiktok/queries"
+import { type IntegrationKey, integrations } from "@/integration"
+import { logger } from "@/lib/log"
+import { isBrokerHost } from "@/lib/oauth-broker"
+import {
+  addRouteScopedJob,
+  createRouteScopedQueue,
+} from "@/lib/provider-account-route-scope"
+import { logWebhookRequestBody } from "@/lib/webhook-log"
+
+type CredentialType = Parameters<
+  typeof platformCredentialService.resolveForOwner
+>[0]["type"]
+
+type CredentialScopedIntegrationRouting = {
+  integrationIdentifier: string
+  integrationType: string
+}
+
+const getCredentialScopedIntegrationRouting = (
+  payload: unknown,
+): CredentialScopedIntegrationRouting | null => {
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    !("data" in payload) ||
+    typeof payload.data !== "object" ||
+    payload.data === null
+  ) {
+    return null
+  }
+
+  if (
+    "integrationIdentifier" in payload.data &&
+    typeof payload.data.integrationIdentifier === "string" &&
+    "integrationType" in payload.data &&
+    typeof payload.data.integrationType === "string"
+  ) {
+    return {
+      integrationIdentifier: payload.data.integrationIdentifier,
+      integrationType: payload.data.integrationType,
+    }
+  }
+
+  if (
+    "phoneNumberId" in payload.data &&
+    typeof payload.data.phoneNumberId === "string"
+  ) {
+    return {
+      integrationIdentifier: payload.data.phoneNumberId,
+      integrationType: "whatsapp",
+    }
+  }
+
+  return null
+}
+
+const normalizeCredentialScopedWebhookUrl = (
+  url: string,
+  credentialId?: string,
+): string => {
+  if (!credentialId) {
+    return url
+  }
+
+  const webhookUrl = new URL(url)
+  webhookUrl.pathname =
+    webhookUrl.pathname.split("/").slice(0, -2).join("/") || "/"
+  return webhookUrl.toString()
+}
+
+const normalizeCredentialScopedWebhookRequest = (
+  req: NextRequest,
+  credentialId?: string,
+): Request =>
+  credentialId
+    ? new Request(
+        normalizeCredentialScopedWebhookUrl(req.url, credentialId),
+        req,
+      )
+    : req
+
+/** The provider app id a credential's config carries, which the webhook route authenticates against. */
+const readCredentialAppId = (config: unknown): string | undefined =>
+  typeof config === "object" &&
+  config !== null &&
+  "clientId" in config &&
+  typeof config.clientId === "string" &&
+  config.clientId.length > 0
+    ? config.clientId
+    : undefined
+
+/** Who a webhook route speaks for: the credential's owner, or the platform when no tenant or user owns the credential. */
+const resolveRouteScope = (
+  credentialOwnerId: string | undefined,
+  config: unknown,
+): ProviderAccountRouteScope | undefined => {
+  const appId = readCredentialAppId(config)
+  if (!appId) {
+    return
+  }
+  return credentialOwnerId
+    ? { kind: "credentialOwner", ownerId: credentialOwnerId, appId }
+    : { kind: "platform", appId }
+}
+
+const createCredentialScopedQueue = (
+  ownerId: string,
+  routeScope: ProviderAccountRouteScope | undefined,
+): ContextQueue => {
+  const ownerChecks = new Map<string, Promise<boolean>>()
+
+  const belongsToOwner = (
+    routing: CredentialScopedIntegrationRouting,
+  ): Promise<boolean> => {
+    const { integrationIdentifier, integrationType } = routing
+    const key = `${integrationType}:${integrationIdentifier}`
+    const existingCheck = ownerChecks.get(key)
+    if (existingCheck) {
+      return existingCheck
+    }
+
+    const check = (async () => {
+      try {
+        const { inbox } =
+          await integrationService.identifyInboxAndIntegrationAuthFromIdentifier(
+            integrationType as IntegrationType,
+            integrationIdentifier,
+          )
+        const inboxOwnerId =
+          await workspaceMemberService.findOwnerUserIdByWorkspaceId({
+            workspaceId: inbox.workspaceId,
+          })
+
+        if (inboxOwnerId === ownerId) {
+          return true
+        }
+
+        logger.warn(
+          { integrationIdentifier, integrationType, ownerId },
+          "Ignoring credential-scoped webhook for another owner's inbox",
+        )
+        return false
+      } catch (err) {
+        if (!(err instanceof IntegrationNotFoundError)) {
+          throw err
+        }
+        logger.warn(
+          { err, integrationIdentifier, integrationType, ownerId },
+          "Ignoring credential-scoped webhook for an unresolved inbox",
+        )
+        return false
+      }
+    })()
+    ownerChecks.set(key, check)
+    return check
+  }
+
+  return {
+    add: async (name, payload, options) => {
+      if (name === IntegrationJobAction.providerAccountEvent) {
+        return await addRouteScopedJob(name, payload, options, routeScope)
+      }
+
+      const routing = getCredentialScopedIntegrationRouting(payload)
+      if (!routing) {
+        logger.error(
+          { name, ownerId },
+          "Ignoring credential-scoped webhook job without ownership routing fields",
+        )
+        return
+      }
+
+      if (!(await belongsToOwner(routing))) {
+        return
+      }
+
+      return await addRouteScopedJob(name, payload, options, routeScope)
+    },
+  }
+}
+const WEBHOOK_PUBLIC_ERROR_HEADERS = {
+  "Content-Type": "application/json",
+} as const
+
+const jsonError = (message: string, status: number) =>
+  new Response(JSON.stringify({ message }), {
+    status,
+    headers: WEBHOOK_PUBLIC_ERROR_HEADERS,
+  })
+
+const THREADS_BAD_REQUEST_MESSAGES = new Set([
+  "Empty webhook payload",
+  "Invalid webhook signature",
+  "Invalid webhook verification parameters",
+  "Missing webhook signature",
+  "Webhook app_id does not match configured clientId",
+])
+
+const createThreadsErrorResponse = (error: unknown) => {
+  const safeError = getSafeErrorDetails(error)
+
+  let status = safeError.httpStatusCode
+
+  if (status === undefined) {
+    if (safeError.message.startsWith("Unsupported HTTP method:")) {
+      status = 405
+    } else if (THREADS_BAD_REQUEST_MESSAGES.has(safeError.message)) {
+      status = 400
+    } else {
+      status = 500
+    }
+  }
+
+  if (status < 400 || status > 599) {
+    status = 500
+  }
+
+  const isClientError = status >= 400 && status < 500
+  return {
+    publicMessage: isClientError
+      ? "Invalid Threads webhook request"
+      : "Failed to process Threads webhook",
+    safeError,
+    status,
+  }
+}
+
+const notConfigured = () => jsonError("Integration is not configured", 404)
+
+export const handleWebhook = async (
+  integrationType: string,
+  req: NextRequest,
+  credentialId?: string,
+) => {
+  if (integrationType === "threads") {
+    return credentialId ? notConfigured() : handleThreadsWebhook(req)
+  }
+
+  await logWebhookRequestBody(integrationType, req)
+
+  // Telegram uses per-bot config (not org-level settings)
+  if (integrationType === "telegram") {
+    return handleTelegramWebhook(req)
+  }
+
+  // LINE uses per-channel config: the row's channel secret signs the body.
+  if (integrationType === "line") {
+    return handleLineWebhook(req)
+  }
+
+  // TikTok uses per-account config (not org-level settings).
+  // A credential-scoped route additionally proves the addressed credential
+  // belongs to the account receiving the event.
+  if (integrationType === "tiktok") {
+    return handleTiktokWebhook(req, credentialId)
+  }
+
+  const type = integrationType as CredentialType
+
+  let credential:
+    | Awaited<
+        ReturnType<typeof platformCredentialService.findDecryptedPlatform>
+      >
+    | undefined
+  let credentialOwnerId: string | undefined
+  // Set only for a tenant's custom domain; otherwise the platform app speaks.
+  let customDomainOwnerId: string | undefined
+
+  if (credentialId) {
+    if (!isCloud()) {
+      return notConfigured()
+    }
+    credential = await platformCredentialService.findDecryptedForWebhook({
+      id: credentialId,
+      type,
+    })
+    credentialOwnerId = credential?.userId ?? undefined
+    if (!credentialOwnerId) {
+      return notConfigured()
+    }
+  } else if (isCloud()) {
+    const domain = req.headers.get("x-domain") ?? ""
+
+    if (isBrokerHost(domain)) {
+      // Broker (platform) domain: use global platform credential
+      credential = await platformCredentialService.findDecryptedPlatform({
+        type,
+      })
+    } else {
+      // Custom domain: tenant-specific lookup
+      const customDomain = domain
+        ? await customDomainService.findActiveByDomain(domain)
+        : undefined
+
+      if (!customDomain) {
+        logger.debug(
+          { integrationType, domain },
+          "No active custom domain for integration webhook",
+        )
+        return notConfigured()
+      }
+
+      const tenant = await tenantService.findById(customDomain.tenantId)
+      if (!tenant?.ownerId || tenant.status !== "active") {
+        logger.debug(
+          { integrationType, domain },
+          "Tenant disabled for integration webhook",
+        )
+        return notConfigured()
+      }
+
+      // Tenant's own credential — no fallback to global platform
+      credential = await platformCredentialService.findDecryptedForUser({
+        userId: tenant.ownerId,
+        type,
+        requireOwnCredential: true,
+      })
+      customDomainOwnerId = tenant.ownerId
+    }
+  } else {
+    // Non-cloud (OSS/enterprise): single-tenant, always use global platform credential
+    credential = await platformCredentialService.findDecryptedPlatform({ type })
+  }
+
+  if (!credential) {
+    logger.debug(`Integration ${integrationType} is not configured`)
+    return notConfigured()
+  }
+
+  const integration = integrations[integrationType as IntegrationKey]
+
+  if (!integration?.handleRequest) {
+    return jsonError("Method is not implemented", 400)
+  }
+
+  const redirectUrl = new URL(
+    `/integrations/${integration.name}/callback`,
+    req.nextUrl,
+  ).toString()
+
+  const settings = credential.config
+  // A credential in the request path (`/c/{id}`) or on a tenant's custom domain
+  // speaks for its owner; the broker host speaks for the platform.
+  const routeScope = resolveRouteScope(
+    credentialOwnerId ?? customDomainOwnerId,
+    settings,
+  )
+
+  try {
+    const result = await integration.handleRequest({
+      config: {
+        ...settings,
+        redirectUrl,
+        stateParams: {
+          workspaceId: req.nextUrl.searchParams.get("workspaceId") ?? "",
+          referer: req.nextUrl.toString(),
+        },
+        // biome-ignore lint/suspicious/noExplicitAny: safe pass value
+      } as any,
+      req: normalizeCredentialScopedWebhookRequest(req, credentialId),
+      queue: credentialOwnerId
+        ? createCredentialScopedQueue(credentialOwnerId, routeScope)
+        : createRouteScopedQueue(routeScope),
+    })
+
+    return new Response(result as BodyInit)
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : String(e)
+    logger.error(
+      { err: e, integrationType },
+      "Integration handleRequest failed",
+    )
+    // Respect the exception's own status (e.g. 401 from a failed inbound
+    // webhook signature check) instead of always answering 400 — every
+    // SdkException still defaults its httpStatusCode to 400, so this is a
+    // no-op for exceptions that never set one.
+    const status = e instanceof SdkException ? e.httpStatusCode : 400
+    return jsonError(message, status)
+  }
+}
+
+const handleThreadsWebhook = async (req: NextRequest) => {
+  const appId = req.nextUrl.searchParams.get("appId")?.trim()
+
+  if (!appId) {
+    return notConfigured()
+  }
+
+  const integration = integrations.threads
+  if (!integration?.handleRequest) {
+    return jsonError("Method is not implemented", 400)
+  }
+
+  const credential =
+    await platformCredentialService.findDecryptedThreadsByClientId({
+      clientId: appId,
+    })
+
+  if (!credential) {
+    logger.debug(
+      { appId, integrationType: "threads" },
+      "No configured Threads credential for webhook appId",
+    )
+    return notConfigured()
+  }
+
+  const redirectUrl = new URL(
+    `/integrations/${integration.name}/callback`,
+    req.nextUrl,
+  ).toString()
+
+  try {
+    const result = await integration.handleRequest({
+      config: {
+        ...credential.config,
+        redirectUrl,
+        stateParams: {
+          workspaceId: req.nextUrl.searchParams.get("workspaceId") ?? "",
+          referer: req.nextUrl.toString(),
+        },
+        // biome-ignore lint/suspicious/noExplicitAny: safe pass value
+      } as any,
+      req,
+      queue: integrationQueue,
+    })
+
+    return new Response(result as BodyInit)
+  } catch (e: unknown) {
+    const { publicMessage, safeError, status } = createThreadsErrorResponse(e)
+    logger.error(
+      {
+        err: safeError,
+        integrationType: "threads",
+        status,
+      },
+      "Threads handleRequest failed",
+    )
+    return jsonError(publicMessage, status)
+  }
+}
+
+const handleTelegramWebhook = async (req: NextRequest) => {
+  const botId = req.nextUrl.searchParams.get("botId")
+  if (!botId) {
+    return jsonError("Missing botId query param", 400)
+  }
+
+  const integration = integrations.telegram
+  if (!integration?.handleRequest) {
+    return jsonError("Method is not implemented", 400)
+  }
+
+  const integrationTelegram = await findIntegrationTelegramByBotId({ botId })
+  if (!integrationTelegram) {
+    return jsonError("Bot not found", 404)
+  }
+
+  const auth = integrationTelegram.auth as {
+    secretText: string
+    metadata?: { botId?: string; webhookSecretToken?: string }
+  }
+
+  try {
+    const result = await integration.handleRequest({
+      config: {
+        botId: integrationTelegram.botId,
+        webhookSecretToken: auth.metadata?.webhookSecretToken,
+        // biome-ignore lint/suspicious/noExplicitAny: safe pass value
+      } as any,
+      req,
+      queue: integrationQueue,
+    })
+
+    return new Response(result as BodyInit)
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : String(e)
+    logger.error(
+      { err: e, integrationType: "telegram" },
+      "Telegram handleRequest failed",
+    )
+    return jsonError(message, 400)
+  }
+}
+
+/**
+ * D8/D15: route by the `channelId` query param, verify with that row's
+ * channel secret (inside the handler, over the raw body — `req` is passed on
+ * unread). An unknown channel is acked with 200 so LINE stops redelivering
+ * after a disconnect (LINE has no webhook "unset").
+ */
+const handleLineWebhook = async (req: NextRequest) => {
+  const channelId = req.nextUrl.searchParams.get("channelId")
+  if (!channelId) {
+    return jsonError("Missing channelId query param", 400)
+  }
+
+  const integration = integrations.line
+  if (!integration?.handleRequest) {
+    return jsonError("Method is not implemented", 400)
+  }
+
+  const integrationLine =
+    await lineIntegrationService.findByChannelId(channelId)
+  if (!integrationLine) {
+    logger.info(
+      { channelId, integrationType: "line" },
+      "Dropping LINE webhook for an unknown channel",
+    )
+    return new Response("OK")
+  }
+
+  const auth = integrationLine.auth as { clientSecret?: string }
+
+  try {
+    const result = await integration.handleRequest({
+      config: {
+        channelId: integrationLine.channelId,
+        channelSecret: auth.clientSecret ?? "",
+        botUserId: integrationLine.botUserId,
+        // biome-ignore lint/suspicious/noExplicitAny: safe pass value
+      } as any,
+      req,
+      queue: integrationQueue,
+    })
+
+    return new Response(result as BodyInit)
+  } catch (e: unknown) {
+    return lineWebhookErrorResponse(e, channelId)
+  }
+}
+
+const HTTP_CLIENT_ERROR_MIN = 400
+const HTTP_SERVER_ERROR_MIN = 500
+
+/**
+ * The handler's own rejections carry their status (`LineException`: 401 bad
+ * signature, 400 wrong destination or unreadable body) and are answered with
+ * it. Anything else is our failure (queue, Redis, DB): a 500, so LINE's
+ * webhook redelivery (when enabled in the LINE console) retries the batch.
+ * Events already enqueued before the failure are safe to see again: messages
+ * dedupe on `sourceId` (LINE message id, or `webhookEventId` for a postback)
+ * and follow/unfollow are ordered by event time. A 500's message stays
+ * generic: it can carry internal detail.
+ */
+const lineWebhookErrorResponse = (error: unknown, channelId: string) => {
+  const status =
+    error instanceof SdkException &&
+    error.httpStatusCode >= HTTP_CLIENT_ERROR_MIN &&
+    error.httpStatusCode < HTTP_SERVER_ERROR_MIN
+      ? error.httpStatusCode
+      : HTTP_SERVER_ERROR_MIN
+  const logContext = { err: error, integrationType: "line", channelId, status }
+  if (status < HTTP_SERVER_ERROR_MIN) {
+    logger.warn(logContext, "LINE webhook rejected")
+    return jsonError((error as SdkException).message, status)
+  }
+  logger.error(logContext, "LINE handleRequest failed")
+  return jsonError("Internal error", HTTP_SERVER_ERROR_MIN)
+}
+
+const handleTiktokWebhook = async (req: NextRequest, credentialId?: string) => {
+  let credentialOwnerId: string | undefined
+  if (credentialId) {
+    if (!isCloud()) {
+      return notConfigured()
+    }
+    const credential = await platformCredentialService.findDecryptedForWebhook({
+      id: credentialId,
+      type: "tiktok",
+    })
+    credentialOwnerId = credential?.userId ?? undefined
+    if (!credentialOwnerId) {
+      return notConfigured()
+    }
+  }
+
+  const integration = integrations.tiktok
+
+  if (!integration?.handleRequest) {
+    return jsonError("Method is not implemented", 400)
+  }
+
+  const bodyText = await req.text()
+
+  if (!bodyText) {
+    return jsonError("Empty webhook payload", 400)
+  }
+
+  let userOpenId: string | undefined
+  let eventType: string | undefined
+  try {
+    const parsed = JSON.parse(bodyText) as Record<string, unknown>
+    userOpenId =
+      typeof parsed.user_openid === "string" ? parsed.user_openid : undefined
+    eventType = typeof parsed.event === "string" ? parsed.event : undefined
+  } catch {
+    // Invalid JSON — the integration handler returns the detailed error.
+  }
+
+  if (!userOpenId) {
+    return jsonError("Missing user_openid in payload", 400)
+  }
+
+  const integrationTiktok = await findIntegrationTiktokByOpenId({
+    openId: userOpenId,
+  })
+  if (!integrationTiktok) {
+    return jsonError("TikTok account not found", 404)
+  }
+
+  const workspaceOwnerId =
+    credentialOwnerId || eventType === "authorization.removed"
+      ? await workspaceMemberService.findOwnerUserIdByWorkspaceId({
+          workspaceId: integrationTiktok.workspaceId,
+        })
+      : undefined
+  if (credentialOwnerId && workspaceOwnerId !== credentialOwnerId) {
+    logger.warn(
+      {
+        credentialOwnerId,
+        openId: userOpenId,
+        workspaceId: integrationTiktok.workspaceId,
+      },
+      "Ignoring credential-scoped TikTok webhook for another owner's inbox",
+    )
+    return notConfigured()
+  }
+
+  if (eventType === "authorization.removed") {
+    const connection = await connectionStateService.markUnhealthyByIdentifier({
+      provider: "tiktok",
+      identifier: userOpenId,
+      reason: "token_revoked",
+      ownerId: workspaceOwnerId as string,
+      workspaceId: integrationTiktok.workspaceId,
+    })
+    if (!connection) {
+      // No `Connection` row yet for this provider/workspace — the inbox
+      // predates the TikTok backfill. Mirror the legacy "set status
+      // disconnected" behavior directly on the `Inbox` row so a
+      // revoked-token inbox doesn't silently stay `connected`; never
+      // `inboxService.disconnect`, which also releases `channels` quota
+      // this un-backfilled row was never counted against.
+      await connectionStateService.markLegacyInboxUnhealthy({
+        inboxId: integrationTiktok.inboxId,
+        workspaceId: integrationTiktok.workspaceId,
+        reason: "token_revoked",
+      })
+      logger.info(
+        { openId: userOpenId, workspaceId: integrationTiktok.workspaceId },
+        "TikTok authorization removed — no Connection row; marked legacy inbox unhealthy",
+      )
+      return new Response("ok")
+    }
+    logger.info(
+      { openId: userOpenId },
+      "TikTok authorization removed — connection marked unhealthy",
+    )
+    return new Response("ok")
+  }
+
+  const auth = integrationTiktok.auth as TiktokAuthValue
+
+  // Reconstruct request because req.text() already consumed the body.
+  const reqWithBody = new Request(
+    normalizeCredentialScopedWebhookUrl(req.url, credentialId),
+    {
+      method: req.method,
+      headers: req.headers,
+      body: bodyText,
+    },
+  )
+
+  const tiktokConfig: TiktokConfig = {
+    clientId: auth.clientId,
+    clientSecret: auth.clientSecret,
+    redirectUrl: auth.redirectUrl,
+    openId: integrationTiktok.openId,
+  }
+
+  try {
+    const result = await integration.handleRequest({
+      config: tiktokConfig,
+      req: reqWithBody,
+      // Routed through `enqueueIntegrationJob` so echoes reach the `low` queue.
+      queue: createRouteScopedQueue(undefined),
+    })
+
+    return new Response(result as BodyInit)
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : String(e)
+    logger.error(
+      { err: e, integrationType: "tiktok" },
+      "TikTok handleRequest failed",
+    )
+    return jsonError(message, 400)
+  }
+}

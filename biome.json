@@ -1,0 +1,149 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "vcs": {
+    "enabled": false,
+    "clientKind": "git",
+    "useIgnoreFile": false
+  },
+  "files": {
+    "ignoreUnknown": false,
+    "includes": [
+      "apps/**",
+      "packages/**",
+      "integrations/**",
+      "!**/.next",
+      "!**/next-env.d.ts",
+      "!**/messages/*.d.json.ts",
+      "!**/packages/database/drizzle",
+      "!**/.turbo",
+      "!**/packages/ui/src/components/data-table",
+      "!**/packages/ui/src/components/ui",
+      "!**/packages/ui/src/lib",
+      "!**/packages/ui/src/hooks",
+      "!**/packages/ui/src/components/carousel-snap.tsx",
+      "!**/packages/ui/src/types/data-table.ts",
+      "!**/dist",
+      "!**/coverage",
+      "!**/.github/assets/readme",
+      "!**/apps/builder/public/brand",
+      "!**/apps/builder/public/chat-widget/plugin-toggle.svg",
+      "!**/.claude"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space"
+  },
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
+  },
+  "linter": {
+    "enabled": true,
+    "domains": {
+      "test": "recommended"
+    },
+    "rules": {
+      "recommended": true,
+      "correctness": {
+        "noUnusedImports": {
+          "level": "error",
+          "fix": "safe"
+        },
+        "noUnusedVariables": {
+          "level": "error",
+          "options": {
+            "ignoreRestSiblings": true
+          }
+        },
+        "noUnknownProperty": "error"
+      },
+      "style": {
+        "useNodejsImportProtocol": "off",
+        "noMagicNumbers": "off",
+        "useConsistentTypeDefinitions": "off"
+      },
+      "suspicious": {
+        "noUnknownAtRules": "off",
+        "noDuplicateCustomProperties": "off"
+      },
+      "complexity": {
+        "noExcessiveLinesPerFunction": "off",
+        "noExcessiveCognitiveComplexity": "off"
+      },
+      "performance": {
+        "noBarrelFile": "off"
+      }
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double",
+      "semicolons": "asNeeded",
+      "trailingCommas": "all"
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["apps/**", "integrations/**", "!**/__tests__/**"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "paths": {
+                  "@chatbotx.io/database/client": {
+                    "importNames": ["db"],
+                    "message": "App code calls a service from @chatbotx.io/business, never db directly. See .agents/rules/data-access.md."
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "apps/builder/src/app/integrations/\\[...integration\\]/callback.ts",
+        "apps/builder/src/features/integration-instagram/actions/disconnect-instagram.ts",
+        "apps/builder/src/features/integration-instagram/lib/update-instagram-settings.ts",
+        "apps/builder/src/features/integration-messenger/lib/update-messenger-settings.ts",
+        "apps/builder/src/features/integration-whatsapp/actions/disconnect.action.ts",
+        "apps/builder/src/features/messages/actions/create-webchat-message.action.ts",
+        "apps/worker/src/ai-agent/handlers/process-conversation-source-embedding.ts",
+        "apps/worker/src/ai-agent/handlers/process-pending-embeddings.ts",
+        "apps/worker/src/default/handlers/send-audit-log.ts",
+        "apps/worker/src/integration/handlers/flow.ts",
+        "apps/worker/src/sequence-scheduler/revert-dispatch.ts",
+        "apps/worker/src/sequence-scheduler/services/retry-scheduler.service.ts",
+        "apps/worker/src/trigger/services/handoff-executor.service.ts"
+      ],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "apps/builder/**",
+        "packages/ui/**",
+        "packages/analytics-nextjs/**",
+        "packages/minigame-ui/**"
+      ],
+      "linter": { "domains": { "react": "recommended" } }
+    },
+    {
+      "includes": ["apps/builder/**", "packages/auth/**", "packages/ui/**"],
+      "linter": { "domains": { "next": "recommended" } }
+    }
+  ],
+  "extends": ["ultracite/biome/core", "ultracite/biome/next"]
+}

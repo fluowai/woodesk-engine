@@ -1,0 +1,107 @@
+{
+  "$schema": "https://v2-11-10.turborepo.dev/schema.json",
+  "ui": "tui",
+  // Root tsconfig extended by packages/database and packages/business; turbo
+  // cannot see it from either workspace, so declare it or edits to it hit cache
+  // and are skipped by `--filter=...[HEAD]`.
+  "globalDependencies": ["tsconfig.base.json"],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "inputs": ["$TURBO_DEFAULT$", ".env*"],
+      "outputs": [".next/**", "!.next/cache/**", "dist/**"],
+      "passThroughEnv": [
+        "BETTER_AUTH_SECRET",
+        "BETTER_AUTH_URL",
+        "SUPPORT_ACCESS_REQUIRE_CONSENT",
+        "AUTH_DISABLE_SIGNUP",
+        "AUTH_OAUTH_ENABLED",
+        "AUTH_OAUTH_CLIENT_ID",
+        "AUTH_OAUTH_CLIENT_SECRET",
+        "AUTH_OAUTH_DISCOVERY_URL",
+        "AUTH_OAUTH_AUTH_URL",
+        "AUTH_OAUTH_TOKEN_URL",
+        "AUTH_OAUTH_USERINFO_URL",
+        "AUTH_OAUTH_SCOPES",
+        "AUTH_OAUTH_TRUST_EMAIL",
+        "AUTH_OAUTH_DISABLE_NONCE_BINDING",
+        "NEXT_PUBLIC_AUTH_OAUTH_DISPLAY_NAME",
+        "NEXT_PUBLIC_AUTH_OAUTH_LOGO_URL"
+      ]
+    },
+    // No `dependsOn: ["^lint"]`: Biome lints every file independently, so the
+    // fan-in conveyed no ordering. Worse, only builder defines a real `lint`
+    // script — the other 57 workspace tasks are <NONEXISTENT> placeholders
+    // that turbo still scheduled and hash-checked behind the chain.
+    "lint": {},
+    // No `dependsOn: ["^check-types"]`: nothing in this repo sets `composite`
+    // or `references`, and every package `exports` resolves to `./src/*.ts`
+    // (no package ships a `dist`). So each `tsc --noEmit` re-parses its
+    // dependencies' source itself and consumes nothing a prior task emitted —
+    // the edge transmitted no data and only serialized 56 tasks 13 deep.
+    //
+    // Locally only apps/builder and packages/ui set `incremental: true` and
+    // emit a tsbuildinfo, so `outputs` is declared in their own turbo.json
+    // (a root-level key makes turbo warn "no output files found" elsewhere).
+    // CI passes `--incremental` to every task and caches the files itself.
+    // `transit` is a no-op (no workspace defines the script) that chains to
+    // every workspace dependency. `check-types` and `test` depend on it so
+    // their hash covers the source of the internal packages they import:
+    // without it, a change to packages/business or packages/realtime-protocol
+    // left builder's and worker's cached results valid, and CI replayed them
+    // instead of re-running. Unlike `^check-types`/`^test`, the edge adds no
+    // ordering between real tasks — transit tasks finish instantly.
+    "transit": {
+      "dependsOn": ["^transit"]
+    },
+    "check-types": {
+      "dependsOn": ["transit"]
+    },
+    "test": {
+      "dependsOn": ["transit"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        ".env*",
+        "vitest.config.ts",
+        "vitest.config.*.ts",
+        "**/__tests__/**",
+        "**/*.test.ts",
+        "**/*.test.tsx",
+        "**/*.spec.ts",
+        "**/*.spec.tsx"
+      ],
+      "outputs": [],
+      // turbo runs in strict env mode, so without this the escape hatch in
+      // packages/vitest-config/src/node.ts never reaches vitest through
+      // `turbo run test` — which is how CI invokes it. passThroughEnv (not
+      // env) is deliberate: worker count changes timing, not test results, so
+      // it must not become part of the cache hash.
+      "passThroughEnv": ["VITEST_MAX_WORKERS"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "https": {
+      "cache": false,
+      "persistent": true
+    },
+    "packages:dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "db:migrate": {
+      "cache": false,
+      "persistent": true
+    },
+    "db:setup": {
+      "cache": false
+    },
+    "db:reset": {
+      "cache": false
+    },
+    "db:studio": {
+      "cache": false
+    }
+  }
+}

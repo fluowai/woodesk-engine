@@ -1,0 +1,319 @@
+import type { RichButtonPayloadEntry as DatabaseRichButtonPayloadEntry } from "@chatbotx.io/database/schema"
+import type {
+  ContactInboxModel,
+  ConversationModel,
+  MessageModel,
+} from "@chatbotx.io/database/types"
+import type {
+  ButtonStepProps,
+  MessengerTemplateParams,
+  MetadataPayload,
+  SendAudioStepSchema,
+  SendCardStepSchema,
+  SendCarouselStepSchema,
+  SendCollectionStepSchema,
+  SendFileStepSchema,
+  SendGifStepSchema,
+  SendImageStepSchema,
+  SendMessengerTemplateMessageStepSchema,
+  SendMultipleImagesStepSchema,
+  SendProductsStepSchema,
+  SendQuickReplyStepSchema,
+  SendTextStepSchema,
+  SendVideoStepSchema,
+  SendViewCatalogStepSchema,
+  SendWaTemplateMessageStepSchema,
+  WaTemplateParams,
+  WaTemplateStatusBranch,
+  WhatsappCallButtonStepSchema,
+  WhatsappLocationStepSchema,
+} from "@chatbotx.io/flow-config"
+import type { CommentAnchor, MessageButtonTemplate } from "@chatbotx.io/sdk"
+import type { SendFrom } from "@chatbotx.io/utils/send-from"
+import { Queue } from "bullmq"
+import {
+  defaultJobOptions,
+  fakeQueue,
+  getQueueConnection,
+  isNoRedisEnv,
+} from "../../lib/connection"
+import { queueNames } from "../../lib/types"
+import type { BotResponseTrackingContext } from "../types"
+
+export type { RichButtonPayloadEntry } from "@chatbotx.io/database/schema"
+
+export const ChatJobAction = {
+  sendChannelMessage: "sendChannelMessage",
+  sendFlowMessage: "sendFlowMessage",
+  sendChatMessage: "sendChatMessage",
+  sendWhatsappTemplateMessage: "sendWhatsappTemplateMessage",
+  sendWhatsappTemplateToConversation: "sendWhatsappTemplateToConversation",
+  sendMessengerTemplateMessage: "sendMessengerTemplateMessage",
+  sendTyping: "sendTyping",
+  notifyExportResult: "notifyExportResult",
+  deleteChannelMessage: "deleteChannelMessage",
+  editChannelMessage: "editChannelMessage",
+  changeChannelMessageState: "changeChannelMessageState",
+  checkOutboundAutomatedResponse: "checkOutboundAutomatedResponse",
+} as const
+
+export type ChatJobSendChannelMessage = {
+  type: typeof ChatJobAction.sendChannelMessage
+  data: {
+    conversation: ConversationModel
+    contactInbox: ContactInboxModel
+    message: MessageModel & {
+      clientId?: string | undefined
+      parentCreatedAt?: Date | null
+    }
+    quickReplies?: MessageButtonTemplate[]
+    metadata?: MetadataPayload
+    isBulkBroadcast?: boolean
+    sendFrom?: SendFrom
+  }
+}
+
+export type ChatJobSendFlowStep = {
+  type: typeof ChatJobAction.sendFlowMessage
+  data: {
+    conversationId: string
+    contactInboxId?: string
+    flowId: string
+    flowVersionId?: string
+    executedFlowVersionId?: string
+    step:
+      | SendTextStepSchema
+      | SendImageStepSchema
+      | SendMultipleImagesStepSchema
+      | SendGifStepSchema
+      | SendFileStepSchema
+      | SendVideoStepSchema
+      | SendAudioStepSchema
+      | SendCardStepSchema
+      | SendCarouselStepSchema
+      | SendQuickReplyStepSchema
+      | SendWaTemplateMessageStepSchema
+      | SendMessengerTemplateMessageStepSchema
+      | WhatsappCallButtonStepSchema
+      | SendProductsStepSchema
+      | SendCollectionStepSchema
+      | WhatsappLocationStepSchema
+      | SendViewCatalogStepSchema
+    trackingContext?: BotResponseTrackingContext
+    metadata?: MetadataPayload
+    /**
+     * Preserves bulk delivery across automatic flow continuations. It is
+     * absent when an inbound button or quick reply starts the flow.
+     */
+    isBulkBroadcast?: boolean
+    appointmentId?: string
+    richResponse?: {
+      executionId: string
+      buttonPayloads: Record<string, DatabaseRichButtonPayloadEntry>
+    }
+    quickReplies?: ButtonStepProps[]
+    /**
+     * Ready-made quick replies appended after the step's own, for a prompt
+     * whose payloads the caller encodes itself (Get User Data's Skip button).
+     */
+    presetQuickReplies?: MessageButtonTemplate[]
+    /**
+     * Set by the flow runner for a `sendWaTemplateMessage` step: the delivery
+     * statuses whose button leads somewhere (actions or a connected node), so
+     * the send records them as status branches of the message it produces.
+     */
+    statusBranches?: WaTemplateStatusBranch[]
+    sendFrom?: SendFrom
+    /** See `IntegrationJobRunFlowNode["data"]["sentByUserId"]`. */
+    sentByUserId?: string
+    /** See {@link CommentAnchor}. */
+    commentAnchor?: CommentAnchor
+  }
+}
+
+export type ChatJobSendChatMessage = {
+  type: typeof ChatJobAction.sendChatMessage
+  data: {
+    conversation: ConversationModel
+    contactInbox?: ContactInboxModel
+    text?: string
+    url?: string
+    storagePath?: string
+    quickReplies?: MessageButtonTemplate[]
+    trackingContext?: BotResponseTrackingContext
+    metadata?: MetadataPayload
+    /** Marks an automatic bulk-broadcast delivery, including a flow's first prompt. */
+    isBulkBroadcast?: boolean
+    /**
+     * The flow step this message asks a question for. Stored on the message as
+     * `flowId`/`stepId`, like a flow step's own messages, so an answer to it is
+     * recognised as part of that flow. Callers without a flow leave it unset.
+     */
+    flowOrigin?: { flowId: string; stepId: string }
+  }
+}
+
+export type ChatJobSendWhatsappTemplateMessage = {
+  type: typeof ChatJobAction.sendWhatsappTemplateMessage
+  data: {
+    conversation: ConversationModel
+    contactInbox: ContactInboxModel
+    templateId: string
+    broadcastId: string
+    templateData?: WaTemplateParams
+    metadata?: MetadataPayload
+  }
+}
+
+/**
+ * Sends one approved WhatsApp template to a single open conversation with
+ * runtime params — the agent's "Send template" action from the inbox composer.
+ * Unlike `sendWhatsappTemplateMessage` there is no broadcast, so no broadcast
+ * sendability guard runs; the template send bypasses the 24h/standby gate
+ * (`isTemplateMessage`), which is exactly why an agent reaches for it.
+ */
+export type ChatJobSendWhatsappTemplateToConversation = {
+  type: typeof ChatJobAction.sendWhatsappTemplateToConversation
+  data: {
+    conversation: ConversationModel
+    contactInbox: ContactInboxModel
+    templateId: string
+    templateData?: WaTemplateParams
+    metadata?: MetadataPayload
+    /**
+     * Who triggered the send. Only `user` (a workspace member in the inbox)
+     * counts as a human agent message in analytics. Absent — automations
+     * (flows, broadcasts) and jobs queued before this field — counts as a bot
+     * message, like `api`.
+     */
+    initiatedBy?: "user" | "api"
+    /** The member behind `initiatedBy: "user"`. */
+    adminId?: string
+    /**
+     * `inbox` when a member sent it from the builder's Inbox: the row is
+     * stamped and kept with its error if the send fails for good. Absent or
+     * `api` — the row is removed on a final failure.
+     */
+    sendFrom?: SendFrom
+  }
+}
+
+export type ChatJobSendMessengerTemplateMessage = {
+  type: typeof ChatJobAction.sendMessengerTemplateMessage
+  data: {
+    conversation: ConversationModel
+    contactInbox: ContactInboxModel
+    templateId: string
+    broadcastId: string
+    templateData?: MessengerTemplateParams
+    // Separate from templateData — create-broadcast.action previously stored
+    // buttons inside templateData causing a type lie. Now explicitly typed.
+    buttons?: Array<{ id: string; label: string; flowId?: string }>
+    metadata?: MetadataPayload
+  }
+}
+
+export type ChatJobSendTyping = {
+  type: typeof ChatJobAction.sendTyping
+  data: {
+    conversation: ConversationModel
+    contactInbox: ContactInboxModel
+    typing: boolean
+    seconds?: number
+    metadata?: MetadataPayload
+  }
+}
+
+export type ChatJobNotifyExportResult = {
+  type: typeof ChatJobAction.notifyExportResult
+  data: Record<string, unknown>
+}
+
+/**
+ * Set when a comment automation hides or deletes a comment, so the handler
+ * settles that comment's `CommentModerationLog` row once the channel answered.
+ */
+export type ChatJobCommentModeration = {
+  automationId: string
+  commentId: string
+}
+
+export type ChatJobDeleteChannelMessage = {
+  type: typeof ChatJobAction.deleteChannelMessage
+  data: {
+    conversation: ConversationModel
+    contactInbox: ContactInboxModel
+    message: {
+      id: string
+      createdAt: Date
+    }
+    /**
+     * Set by AI moderation: the handler also soft-deletes the message in the
+     * inbox after the channel accepted the delete (the builder's delete action
+     * does that before enqueueing).
+     */
+    moderation?: ChatJobCommentModeration
+  }
+}
+
+export type ChatJobEditChannelMessage = {
+  type: typeof ChatJobAction.editChannelMessage
+  data: {
+    conversation: ConversationModel
+    contactInbox: ContactInboxModel
+    message: {
+      id: string
+      createdAt: Date
+    }
+    newText: string
+    newAttachmentUrl?: string
+  }
+}
+
+export type ChatJobChangeChannelMessageState = {
+  type: typeof ChatJobAction.changeChannelMessageState
+  data: {
+    conversation: ConversationModel
+    contactInbox: ContactInboxModel
+    message: {
+      id: string
+      createdAt: Date
+    }
+    liked?: boolean
+    hidden?: boolean
+    moderation?: ChatJobCommentModeration
+  }
+}
+
+export type ChatJobCheckOutboundAutomatedResponse = {
+  type: typeof ChatJobAction.checkOutboundAutomatedResponse
+  data: {
+    conversation: ConversationModel
+    contactInbox: ContactInboxModel
+    message: {
+      id: string
+      text: string
+    }
+  }
+}
+
+export type ChatJobData =
+  | ChatJobSendChannelMessage
+  | ChatJobSendFlowStep
+  | ChatJobSendChatMessage
+  | ChatJobSendWhatsappTemplateMessage
+  | ChatJobSendWhatsappTemplateToConversation
+  | ChatJobSendMessengerTemplateMessage
+  | ChatJobSendTyping
+  | ChatJobNotifyExportResult
+  | ChatJobDeleteChannelMessage
+  | ChatJobEditChannelMessage
+  | ChatJobChangeChannelMessageState
+  | ChatJobCheckOutboundAutomatedResponse
+
+export const chatQueue = isNoRedisEnv()
+  ? fakeQueue
+  : new Queue<ChatJobData>(queueNames.enum.chat, {
+      connection: getQueueConnection(queueNames.enum.chat),
+      defaultJobOptions,
+    })

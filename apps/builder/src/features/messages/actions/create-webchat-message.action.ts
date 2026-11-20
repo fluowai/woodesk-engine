@@ -1,0 +1,548 @@
+"use server"
+
+import {
+  automatedResponseService,
+  isKeywordMediaFileType,
+} from "@chatbotx.io/automated-response"
+import {
+  contactInboxService,
+  contactService,
+  conversationService,
+  integrationWebchatService,
+  isWorkspaceScheduledForDeletion,
+  messageService,
+  queueMessageCreatedEvent,
+  resolveTenantSettings,
+  workspaceService,
+} from "@chatbotx.io/business"
+import { resolveLastUserInputTracking } from "@chatbotx.io/business/contact-inbox"
+import { normalizeLanguage } from "@chatbotx.io/business/contact-locale"
+import { detectContactInfoTypes } from "@chatbotx.io/business/detect-contact-info"
+import { ChatbotXException } from "@chatbotx.io/business/errors"
+import { getPublicFileUrl } from "@chatbotx.io/business/utils"
+
+import {
+  type ConversationAttributes,
+  channelTypes,
+} from "@chatbotx.io/database/partials"
+import type { IntegrationWebchatModel } from "@chatbotx.io/database/types"
+import { emit } from "@chatbotx.io/event-bus"
+import { setWebhookExecutionContext } from "@chatbotx.io/events/context"
+import { type UploadedFile, uploadMultipleFiles } from "@chatbotx.io/filesystem"
+import {
+  decodeStepInputSkipPostback,
+  messageEventTypeSchema,
+  stepInputResolutionReasons,
+} from "@chatbotx.io/flow-config"
+import {
+  buildResolveStepInputJob,
+  IntegrationJobAction,
+  integrationQueue,
+} from "@chatbotx.io/worker-config"
+import { headers } from "next/headers"
+import { getTranslations } from "next-intl/server"
+import { isAllowedGuestOrigin } from "@/features/integration-webchat/lib/authorized-domain"
+import { verifyWebchatAccessToken } from "@/features/integration-webchat/lib/webchat-access-token"
+import { shouldRunWebchatChallenge } from "@/features/messages/lib/should-run-webchat-challenge"
+import { getDomainFromHeader } from "@/lib/domain"
+import { logger } from "@/lib/log"
+import {
+  checkGuestRateLimit,
+  getGuestClientIp,
+} from "@/lib/rate-limit/guest-rate-limit"
+import { actionClient } from "@/lib/safe-action"
+import {
+  type CreateWebchatMessageRequest,
+  createWebchatMessageRequest,
+} from "../schema/mutation"
+
+export const createWebchatMessageAction = actionClient
+  .inputSchema(createWebchatMessageRequest)
+  .action(handleCreateWebchatMessage)
+
+async function _getRequestHeaders() {
+  try {
+    return await headers()
+  } catch {
+    return new Headers()
+  }
+}
+
+export async function handleCreateWebchatMessage({
+  parsedInput,
+}: {
+  parsedInput: CreateWebchatMessageRequest
+}) {
+  setWebhookExecutionContext({ source: "webhook" })
+
+  const workspace = await workspaceService.find({
+    where: { id: parsedInput.workspaceId },
+  })
+  if (!workspace) {
+    throw new ChatbotXException("Workspace not found")
+  }
+  if (isWorkspaceScheduledForDeletion(workspace)) {
+    const t = await getTranslations("webchat")
+    throw new ChatbotXException(
+      t("workspaceUnavailable"),
+      "workspaceScheduledDeletion",
+      403,
+    )
+  }
+
+  const integrationWebchat =
+    await integrationWebchatService.findByIdForWorkspace({
+      workspaceId: parsedInput.workspaceId,
+      id: parsedInput.webchatId,
+    })
+
+  // Bind-on-first-use: always require a token whose signed origin claim
+  // matches the origin the caller is presenting now, regardless of whether
+  // authorizedDomains is configured. This closes the "no auth at all when no
+  // allowlist is set" gap while still layering the (optional) domain
+  // allowlist check on top when the workspace has configured one.
+  const { authorized } = await verifyWebchatAccessToken({
+    token: parsedInput.accessToken,
+    workspaceId: parsedInput.workspaceId,
+    webchatId: parsedInput.webchatId,
+    origin: parsedInput.parentOrigin,
+  })
+
+  if (!authorized) {
+    const t = await getTranslations("webchat.unauthorizedDomain")
+    throw new ChatbotXException(t("description"), "forbidden", 403)
+  }
+
+  const requestHeaders = await _getRequestHeaders()
+
+  if (
+    !isAllowedGuestOrigin(
+      parsedInput.parentOrigin,
+      integrationWebchat.authorizedDomains,
+      await getDomainFromHeader(),
+    )
+  ) {
+    const t = await getTranslations("webchat.unauthorizedDomain")
+    throw new ChatbotXException(t("description"), "forbidden", 403)
+  }
+
+  const rateLimit = await checkGuestRateLimit({
+    clientIp: getGuestClientIp(requestHeaders),
+    guestConversationId: parsedInput.guestConversationId,
+    webchatId: parsedInput.webchatId,
+  })
+  if (rateLimit.limited) {
+    const t = await getTranslations("webchat")
+    throw new ChatbotXException(
+      t("rateLimitExceeded"),
+      "rateLimitExceeded",
+      429,
+    )
+  }
+
+  const { conversation, isNewContact, contact, contactInbox } =
+    await getConversationFromInput(parsedInput, integrationWebchat, workspace)
+
+  if (
+    "init" in parsedInput &&
+    parsedInput.init &&
+    isNewContact &&
+    integrationWebchat.welcomeFlowId
+  ) {
+    await integrationQueue.add(IntegrationJobAction.sendFlow, {
+      type: IntegrationJobAction.sendFlow,
+      data: {
+        conversationId: conversation,
+        contactInboxId: contactInbox,
+        flowId: integrationWebchat.welcomeFlowId,
+        origin: "channel",
+      },
+    })
+  }
+
+  const { storageUrl } = await resolveTenantSettings({
+    workspaceId: parsedInput.workspaceId,
+  })
+
+  // Process flow if exists. Only a flowId that is actually configured as one
+  // of this webchat's persistent-menu "flow" entries may be triggered here —
+  // otherwise a guest holding a valid access token could enqueue an
+  // arbitrary flowId for this workspace (flow injection / IDOR).
+  if ("flowId" in parsedInput) {
+    const isConfiguredFlow = integrationWebchat.persistentMenus.some(
+      (menu) => menu.type === "flow" && menu.flowId === parsedInput.flowId,
+    )
+    if (!isConfiguredFlow) {
+      throw new ChatbotXException("Flow not found", "notFound", 404)
+    }
+
+    await integrationQueue.add(IntegrationJobAction.sendFlow, {
+      type: IntegrationJobAction.sendFlow,
+      data: {
+        conversationId: conversation,
+        contactInboxId: contactInbox,
+        flowId: parsedInput.flowId,
+        origin: "channel",
+      },
+    })
+    return null
+  }
+
+  if ("init" in parsedInput) {
+    return null
+  }
+
+  // Process ref if exists
+  if ("initRef" in parsedInput && parsedInput.initRef) {
+    await integrationQueue.add(IntegrationJobAction.runRef, {
+      type: IntegrationJobAction.runRef,
+      data: {
+        conversationId: conversation,
+        contactInboxId: contactInbox,
+        ref: parsedInput.initRef,
+        isNewContact,
+      },
+    })
+    return null
+  }
+
+  // A Skip tap is resolved by its own job (after the tap's message is saved),
+  // never as a flow action.
+  const stepInputSkipChallengeId =
+    "postback" in parsedInput
+      ? decodeStepInputSkipPostback(parsedInput.postback)
+      : null
+
+  if (
+    "postback" in parsedInput &&
+    parsedInput.postback &&
+    !stepInputSkipChallengeId
+  ) {
+    await automatedResponseService.enqueueFlowAction({
+      kind: "postback",
+      data: {
+        conversationId: conversation,
+        contactInboxId: contactInbox,
+        action: parsedInput.postback,
+      },
+    })
+  }
+
+  // Upload file if exists
+  let uploadedFiles: UploadedFile[] = []
+  if ("files" in parsedInput && parsedInput.files.length > 0) {
+    uploadedFiles = await uploadMultipleFiles(
+      parsedInput.files,
+      `public/space/${parsedInput.workspaceId}/conversations/${conversation.id}`,
+    )
+  }
+
+  if ("text" in parsedInput && (parsedInput.text || uploadedFiles.length > 0)) {
+    const now = new Date()
+    const messageInput = {
+      text: parsedInput.text ?? null,
+      messageType: "incoming" as const,
+      workspaceId: conversation.workspaceId,
+      conversationId: conversation.id,
+      senderType: "contact" as const,
+      senderId: conversation.contactId,
+      contentType: "text" as const,
+      contactInboxId: contactInbox.id,
+      createdAt: now,
+    }
+
+    const attachmentInputs = uploadedFiles.map((file) => ({
+      workspaceId: conversation.workspaceId,
+      conversationId: conversation.id,
+      ...file,
+    }))
+
+    const message =
+      attachmentInputs.length > 0
+        ? await messageService.createWithAttachments({
+            message: messageInput,
+            attachments: attachmentInputs,
+          })
+        : { ...(await messageService.create(messageInput)), attachments: [] }
+
+    const newMessage = {
+      ...message,
+      attachments: message.attachments.map((attachment) => ({
+        ...attachment,
+        url: getPublicFileUrl(attachment.originPath, storageUrl),
+      })),
+    }
+
+    const trackingInvalidation =
+      await conversationService.recordInboundActivity({
+        workspaceId: conversation.workspaceId,
+        conversationId: conversation.id,
+        contactInboxId: contactInbox.id,
+        contactId: contactInbox.contactId,
+        at: message.createdAt,
+        contactRepliedAt: message.createdAt,
+        contactLastReadAt: now,
+        tracking: {
+          firstInteractionAt: message.createdAt,
+          contactLastReadAt: now,
+          lastMessageAt: message.createdAt,
+          lastIncomingMessageAt: message.createdAt,
+          ...resolveLastUserInputTracking({
+            contentType: message.contentType,
+            text: message.text,
+            attachments: message.attachments,
+            storageUrl,
+          }),
+          ...(parsedInput.parentUrl && {
+            webchatParentUrl: parsedInput.parentUrl,
+          }),
+        },
+      })
+    if (trackingInvalidation) {
+      await contactInboxService.invalidateTracking(trackingInvalidation)
+    }
+
+    try {
+      await contactService.unblockIfBlocked(
+        { workspaceId: conversation.workspaceId, id: contactInbox.contactId },
+        contact,
+      )
+    } catch (error) {
+      logger.warn(
+        { err: error, contactId: contactInbox.contactId, channel: "webchat" },
+        "Auto-unblock on webchat inbound message failed",
+      )
+    }
+
+    // Webchat does not write phone/email into the Contact from messages (other
+    // channels do); it only reports which kinds the message holds, for the
+    // "left a phone / email" statistic. Pure text scan with the workspace
+    // already in hand: no query, and no value on the event.
+    const contactInfoTypes = detectContactInfoTypes(
+      newMessage.text,
+      workspace.targetCountry,
+    )
+
+    emit(messageEventTypeSchema.enum["message:received"], {
+      workspaceId: conversation.workspaceId,
+      contactId: contactInbox.contactId,
+      contactInboxId: contactInbox.id,
+      channel: channelTypes.enum.webchat,
+      inboxId: contactInbox.inboxId,
+      occurredAt: newMessage.createdAt ?? new Date(),
+      sourceId: newMessage.sourceId ?? undefined,
+      origin: "inbound",
+      messageId: newMessage.id,
+      contactInfoCapture:
+        contactInfoTypes.length > 0
+          ? {
+              infoTypes: contactInfoTypes,
+              conversationId: conversation.id,
+              conversationCreatedAt: conversation.createdAt.toISOString(),
+            }
+          : undefined,
+    })
+
+    await queueMessageCreatedEvent(
+      newMessage.workspaceId,
+      {
+        ...newMessage,
+        clientId: parsedInput.clientId,
+      },
+      conversation,
+    )
+
+    const promises: Promise<unknown>[] = []
+    // An image/video/audio without text still reaches Keywords (image/video/
+    // audio conditions); the enqueue only queues it when a keyword rule matches.
+    const attachmentFileTypes = newMessage.attachments.map(
+      (attachment) => attachment.fileType,
+    )
+    const hasKeywordMedia = attachmentFileTypes.some(isKeywordMediaFileType)
+
+    const additionalAttributes =
+      conversation.additionalAttributes as unknown as ConversationAttributes
+
+    const hasPostback = Boolean(
+      "postback" in parsedInput && parsedInput.postback,
+    )
+    if (
+      shouldRunWebchatChallenge(
+        additionalAttributes?.challenge,
+        hasPostback,
+        stepInputSkipChallengeId !== null,
+      )
+    ) {
+      promises.push(
+        integrationQueue.add(
+          IntegrationJobAction.runChallenge,
+          {
+            type: IntegrationJobAction.runChallenge,
+            data: {
+              conversationId: conversation,
+              contactInboxId: contactInbox,
+              // Names the message this run answers, so a reply queued before a
+              // later message (a Skip tap) is judged on its own text.
+              messageId: newMessage.id,
+              messageCreatedAt: newMessage.createdAt,
+              challenge: additionalAttributes?.challenge,
+            },
+          },
+          // One run per message, like the webhook channels: each job judges the
+          // message it names, so a deduplicated (dropped) reply would never be
+          // processed. Duplicate or racing runs are settled by the attempt
+          // compare-and-set and the challenge claim.
+          { jobId: `webchat-challenge-${conversation.id}-${newMessage.id}` },
+        ),
+      )
+    } else if (
+      (newMessage.text || hasKeywordMedia) &&
+      !("postback" in parsedInput && parsedInput.postback)
+    ) {
+      const isConversationActive =
+        await conversationService.ensureActive(conversation)
+      if (isConversationActive) {
+        promises.push(
+          automatedResponseService.enqueue({
+            conversationId: conversation.id,
+            contactInboxId: contactInbox.id,
+            messageId: newMessage.id,
+            messageText: newMessage.text ?? undefined,
+            attachmentFileTypes,
+            workspaceId: conversation.workspaceId,
+          }),
+        )
+      } else if (newMessage.text) {
+        promises.push(
+          automatedResponseService.enqueueHandoffReentry({
+            conversationId: conversation.id,
+            contactInboxId: contactInbox.id,
+            messageId: newMessage.id,
+            workspaceId: conversation.workspaceId,
+          }),
+        )
+      }
+    }
+
+    if (isNewContact && contactInbox.sourceId) {
+      emit("analytics:dashboard", {
+        eventType: "contact:created",
+        workspaceId: parsedInput.workspaceId,
+        contactId: contactInbox.id,
+        occurredAt: contact.createdAt,
+        source: contactInbox.source,
+        sourceId: contactInbox.sourceId,
+        channel: contactInbox.channel,
+        inboxId: contactInbox.inboxId,
+        language: normalizeLanguage(contactInbox.language) ?? null,
+        metadata: {
+          triggerContext: {
+            triggerSource: "api",
+            triggerHandler: "createWebchatMessage",
+            triggerType: "contact_created",
+          },
+        },
+      })
+    }
+
+    if (promises.length > 0) {
+      await Promise.allSettled(promises)
+    }
+
+    // Not part of the best-effort list above: if this enqueue fails the
+    // contact is waiting on the Skip, so the failure must surface (the widget
+    // can resend, and the resolution is idempotent).
+    if (stepInputSkipChallengeId) {
+      await enqueueStepInputSkip({
+        conversationId: conversation.id,
+        contactInboxId: contactInbox.id,
+        challengeId: stepInputSkipChallengeId,
+        message: newMessage,
+      })
+    }
+
+    return newMessage
+  }
+
+  return null
+}
+
+function enqueueStepInputSkip(props: {
+  conversationId: string
+  contactInboxId: string
+  challengeId: string
+  message: { id: string; createdAt: Date }
+}) {
+  const { conversationId, contactInboxId, challengeId, message } = props
+
+  const job = buildResolveStepInputJob({
+    conversationId,
+    contactInboxId,
+    challengeId,
+    reason: stepInputResolutionReasons.enum.user_skipped,
+    messageId: message.id,
+    messageCreatedAt: message.createdAt,
+  })
+
+  return integrationQueue.add(job.name, job.data, job.opts)
+}
+
+async function getConversationFromInput(
+  parsedInput: CreateWebchatMessageRequest,
+  integrationWebchat: IntegrationWebchatModel,
+  workspace: { ownerId: string },
+) {
+  const existingContactInbox = await contactInboxService.findLatestBySource({
+    inboxId: integrationWebchat.inboxId,
+    sourceId: parsedInput.guestConversationId,
+    workspaceId: parsedInput.workspaceId,
+  })
+
+  if (existingContactInbox) {
+    const conversation = await conversationService.findBy({
+      where: {
+        workspaceId: parsedInput.workspaceId,
+        contactId: existingContactInbox.contactId,
+      },
+    })
+    const contact = await contactService.findById({
+      workspaceId: parsedInput.workspaceId,
+      id: existingContactInbox.contactId,
+    })
+    if (!conversation) {
+      throw new ChatbotXException("Conversation not found")
+    }
+    if (!contact) {
+      throw new ChatbotXException("Contact not found")
+    }
+
+    return {
+      conversation,
+      contact,
+      contactInbox: existingContactInbox,
+      isNewContact: false,
+    }
+  }
+
+  const created = await integrationWebchatService.findOrCreateGuestConversation(
+    {
+      guestConversationId: parsedInput.guestConversationId,
+      integration: integrationWebchat,
+      locale: parsedInput.locale,
+      parentUrl: parsedInput.parentUrl,
+      timezone: parsedInput.timezone,
+      workspace,
+      workspaceId: parsedInput.workspaceId,
+    },
+  )
+  if (!created) {
+    throw new ChatbotXException("Contact limit reached", "quotaExceeded", 422)
+  }
+
+  return {
+    conversation: created.conversation,
+    contact: created.contact,
+    contactInbox: created.contactInbox,
+    isNewContact: true,
+  }
+}

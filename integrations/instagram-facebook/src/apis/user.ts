@@ -1,0 +1,139 @@
+import type { Context, IncomingContact } from "@chatbotx.io/sdk"
+import { createId } from "@chatbotx.io/utils"
+import { fetchMediaWithLimits } from "@chatbotx.io/utils/media-download"
+import { storeIncomingImage } from "@chatbotx.io/utils/store-incoming-image"
+import { API_URL } from "../constants"
+import { InstagramAPIException, rescue } from "../exception"
+import { instagramGraphClient } from "../lib/http-client"
+import { logger } from "../lib/logger"
+import type { InstagramAuthValue, InstagramUserProfile } from "../schema"
+
+const GRAPH_NONEXISTING_FIELD_ERROR_CODE = 100
+
+const isNonexistingFieldError = (error: unknown): boolean =>
+  error instanceof InstagramAPIException &&
+  error.code === GRAPH_NONEXISTING_FIELD_ERROR_CODE &&
+  error.message.includes("nonexisting field")
+
+const fetchProfileFields = async ({
+  ctx,
+  psid,
+  includeProfilePic,
+}: {
+  ctx: Context<InstagramAuthValue>
+  psid: string
+  includeProfilePic: boolean
+}): Promise<InstagramUserProfile> => {
+  const fields = includeProfilePic
+    ? "name,username,profile_pic"
+    : "name,username"
+  // Auth in the Authorization header, not the query string — a query token
+  // leaks through the request URL captured on HTTP-client errors and logs.
+  const queries = new URLSearchParams({ fields })
+
+  try {
+    return await instagramGraphClient.get<InstagramUserProfile>(
+      `${ctx.auth.metadata.version}/${psid}?${queries.toString()}`,
+      { headers: { Authorization: `Bearer ${ctx.auth.tokens.accessToken}` } },
+    )
+  } catch (error) {
+    // Graph rejects `profile_pic` on some nodes (e.g. the business account's
+    // own id echoed back as a commenter). Retry without it instead of failing
+    // the whole profile lookup over one unavailable field.
+    if (includeProfilePic && isNonexistingFieldError(error)) {
+      logger.warn(
+        { psid },
+        "getUserProfile: profile_pic unavailable, retrying without it",
+      )
+      return await fetchProfileFields({ ctx, psid, includeProfilePic: false })
+    }
+    throw error
+  }
+}
+
+export const getUserProfile = ({
+  ctx,
+  psid,
+  includeAvatar = true,
+}: {
+  ctx: Context<InstagramAuthValue>
+  psid: string
+  includeAvatar?: boolean
+}): Promise<IncomingContact> => {
+  const endpoint = `${API_URL}/${ctx.auth.metadata.version}/${psid}`
+
+  return rescue(endpoint, async () => {
+    const response = await fetchProfileFields({
+      ctx,
+      psid,
+      includeProfilePic: includeAvatar,
+    })
+
+    const result: IncomingContact = {
+      sourceId: psid,
+      firstName: response.name,
+      // Persisted so `@handle` mentions inside a comment can be resolved back
+      // to a known contact — Instagram gives no tagged-user ids, only handles.
+      sourceUsername: response.username,
+    }
+
+    if (includeAvatar && response.profile_pic) {
+      try {
+        result.avatar = await getUserProfilePicture({
+          ctx,
+          pictureUrl: response.profile_pic,
+        })
+      } catch (error) {
+        logger.error(error, "getUserProfilePicture error")
+      }
+    }
+
+    return result
+  })
+}
+
+export const getContactProfilePicUrl = ({
+  ctx,
+  psid,
+}: {
+  ctx: Context<InstagramAuthValue>
+  psid: string
+}): Promise<string | null> => {
+  const endpoint = `${API_URL}/${ctx.auth.metadata.version}/${psid}`
+  return rescue(endpoint, async () => {
+    const response = await fetchProfileFields({
+      ctx,
+      psid,
+      includeProfilePic: true,
+    })
+    return response.profile_pic ?? null
+  })
+}
+
+export const getUserProfilePicture = async ({
+  ctx,
+  pictureUrl,
+}: {
+  ctx: Context<InstagramAuthValue>
+  pictureUrl: string
+}): Promise<string | undefined> => {
+  const media = await fetchMediaWithLimits(pictureUrl, {
+    headers: {
+      Authorization: `Bearer ${ctx.auth.tokens.accessToken}`,
+      "User-Agent": "node",
+    },
+  })
+  if (!media) {
+    return
+  }
+  const stored = await storeIncomingImage({
+    uploader: ctx.uploader,
+    key: `${ctx.storagePrefix}/avatars/${createId()}`,
+    bytes: Buffer.from(media.bytes),
+    mimeType: media.mimeType,
+    profile: "avatar",
+    acl: "public-read",
+  })
+
+  return stored.originPath
+}

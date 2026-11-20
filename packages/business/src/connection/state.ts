@@ -1,0 +1,233 @@
+/**
+ * Pure Connection status state machine. It depends only on status types and
+ * the standard `ChatbotXException`, so it can be unit-tested without a
+ * database and reused by both `ConnectionStateService.transition` (DB writes
+ * + audit) and any future dry-run/preview caller.
+ *
+ * Families: ACTIVE = `connected | degraded` (quota held, `Inbox.status =
+ * connected`). INACTIVE = `needs_reauth | paused | disconnected` (quota
+ * released, `Inbox.status = disconnected`).
+ *
+ * Invariant: quota transitions are calculated at active/inactive edges.
+ * `quotaEdge` is the single source of truth callers use to decide whether to
+ * consume or best-effort release quota — never re-derive it ad hoc.
+ */
+
+import {
+  ACTIVE_CONNECTION_STATUSES,
+  type ActiveConnectionStatus,
+  type ConnectionStatus,
+  type ConnectionStatusReason,
+  isProviderOffboardedConnection,
+} from "@chatbotx.io/database/partials"
+import { ChatbotXException } from "../errors"
+
+export type ConnectionEvent =
+  | "connect.completed"
+  | "auth.saved"
+  | "refresh.transient_failure"
+  | "verify.failed_non_auth"
+  | "verify.ok"
+  | "auth.revoked"
+  | "user.disconnect"
+  | "teardown.pause"
+  | "teardown.resume"
+  | "teardown.disconnect"
+  | "provider.offboarded"
+  | "provider.reconnected"
+
+type ConnectionTransitionInput = {
+  /** `undefined` when no `Connection` row exists yet (first `connect.completed`). */
+  from: ConnectionStatus | undefined
+  /** The stored reason of `from`; needed to recognise the sticky `provider_offboarded` state. */
+  fromReason?: ConnectionStatusReason | null
+  event: ConnectionEvent
+  reason?: ConnectionStatusReason
+}
+
+type ConnectionTransitionResult = {
+  to: ConnectionStatus
+  reason: ConnectionStatusReason | null
+  /** `null` = no quota change; `"consume"`/`"release"` = the edge callers must act on exactly once. */
+  quotaEdge: "consume" | "release" | null
+  /** Idempotent no-op: `to === from`, event carried no real state change. */
+  noop: boolean
+  /**
+   * The event was swallowed because the connection is held in the sticky
+   * `provider_offboarded` state: callers must not clear its `lastError`.
+   */
+  heldByProviderOffboard: boolean
+}
+export const isActiveConnectionStatus = (
+  status: ConnectionStatus,
+): status is ActiveConnectionStatus =>
+  new Set<ConnectionStatus>(ACTIVE_CONNECTION_STATUSES).has(status)
+
+export class InvalidConnectionTransitionException extends ChatbotXException {
+  constructor(from: ConnectionStatus | undefined, event: ConnectionEvent) {
+    super(
+      `Connection cannot handle event "${event}" from status "${from ?? "∅"}"`,
+      "connectionInactive",
+      409,
+    )
+  }
+}
+
+const quotaEdgeFor = (
+  from: ConnectionStatus | undefined,
+  to: ConnectionStatus,
+): "consume" | "release" | null => {
+  const wasActive = from !== undefined && isActiveConnectionStatus(from)
+  const isActive = isActiveConnectionStatus(to)
+  if (!wasActive && isActive) {
+    return "consume"
+  }
+  if (wasActive && !isActive) {
+    return "release"
+  }
+  return null
+}
+
+const result = (
+  from: ConnectionStatus | undefined,
+  to: ConnectionStatus,
+  reason: ConnectionStatusReason | null,
+): ConnectionTransitionResult => ({
+  to,
+  reason,
+  quotaEdge: quotaEdgeFor(from, to),
+  noop: from === to,
+  heldByProviderOffboard: false,
+})
+
+/**
+ * While the provider is re-onboarding the account, a token refresh or health
+ * check succeeding (or failing without proof of revocation) says nothing about
+ * the re-onboarding. Only the provider's own `reconnected` event, a completed
+ * reconnect, or a revoke leaves the state, so these events are held.
+ */
+const EVENTS_HELD_BY_PROVIDER_OFFBOARD: ReadonlySet<ConnectionEvent> = new Set([
+  "auth.saved",
+  "refresh.transient_failure",
+  "verify.failed_non_auth",
+  "verify.ok",
+])
+
+const isProviderOffboarded = (
+  from: ConnectionStatus | undefined,
+  fromReason: ConnectionStatusReason | null | undefined,
+): boolean =>
+  from !== undefined &&
+  isProviderOffboardedConnection({
+    status: from,
+    statusReason: fromReason ?? null,
+  })
+
+/**
+ * Resolve one event against the current status. Throws
+ * {@link InvalidConnectionTransitionException} only for `auth.saved`,
+ * `refresh.transient_failure`, `verify.failed_non_auth`, and `verify.ok`
+ * against an INACTIVE status (`connectionInactive`, HTTP 409). Every other
+ * unmodeled combination is an idempotent no-op that returns the current status.
+ */
+export const transitionConnection = (
+  input: ConnectionTransitionInput,
+): ConnectionTransitionResult => {
+  const { from, fromReason, event, reason } = input
+
+  if (
+    EVENTS_HELD_BY_PROVIDER_OFFBOARD.has(event) &&
+    isProviderOffboarded(from, fromReason)
+  ) {
+    return {
+      ...result(from, "degraded", "provider_offboarded"),
+      heldByProviderOffboard: true,
+    }
+  }
+
+  switch (event) {
+    case "connect.completed": {
+      if (from === "connected") {
+        return result(from, from, null)
+      }
+      return result(from, "connected", null)
+    }
+    case "auth.saved": {
+      if (from === undefined || !isActiveConnectionStatus(from)) {
+        throw new InvalidConnectionTransitionException(from, event)
+      }
+      return result(from, "connected", null)
+    }
+    case "refresh.transient_failure":
+    case "verify.failed_non_auth": {
+      if (from === undefined || !isActiveConnectionStatus(from)) {
+        throw new InvalidConnectionTransitionException(from, event)
+      }
+      return result(from, "degraded", reason ?? "refresh_failed")
+    }
+    case "verify.ok": {
+      if (from === undefined || !isActiveConnectionStatus(from)) {
+        throw new InvalidConnectionTransitionException(from, event)
+      }
+      return result(from, "connected", null)
+    }
+    case "auth.revoked": {
+      if (from === undefined || !isActiveConnectionStatus(from)) {
+        return result(from, from ?? "needs_reauth", null)
+      }
+      return result(from, "needs_reauth", reason ?? "token_revoked")
+    }
+    case "user.disconnect": {
+      if (from === undefined) {
+        return result(from, "disconnected", "manual")
+      }
+      // Already disconnected: a no-op re-assertion must preserve whatever
+      // reason/`disconnectedAt` is already stored, not overwrite it with
+      // `manual` just because this event fired again.
+      if (from === "disconnected") {
+        return result(from, from, null)
+      }
+      return result(from, "disconnected", reason ?? "manual")
+    }
+    case "teardown.pause": {
+      if (from === undefined || !isActiveConnectionStatus(from)) {
+        return result(from, from ?? "paused", null)
+      }
+      return result(from, "paused", reason ?? "trial_expired")
+    }
+    case "teardown.resume": {
+      if (from !== "paused") {
+        return result(from, from ?? "paused", null)
+      }
+      return result(from, "connected", null)
+    }
+    case "teardown.disconnect": {
+      // Already disconnected: same preserve-on-no-op rule as `user.disconnect`
+      // above — repeated teardown must not stomp the stored reason.
+      if (from === "disconnected") {
+        return result(from, from, null)
+      }
+      return result(from, "disconnected", reason ?? "workspace_purge")
+    }
+    case "provider.offboarded": {
+      // An inactive connection has nothing left to hold open; an already
+      // offboarded one keeps its state.
+      if (from === undefined || !isActiveConnectionStatus(from)) {
+        return result(from, from ?? "needs_reauth", null)
+      }
+      return result(from, "degraded", "provider_offboarded")
+    }
+    case "provider.reconnected": {
+      // Only the offboarded hold is released: a late `reconnected` must never
+      // resume a paused/disconnected row or clear an unrelated degradation.
+      if (!isProviderOffboarded(from, fromReason)) {
+        return result(from, from ?? "needs_reauth", null)
+      }
+      return result(from, "connected", null)
+    }
+    default: {
+      const _exhaustive: never = event
+      throw new InvalidConnectionTransitionException(from, _exhaustive)
+    }
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "name": "@chatbotx.io/integration-whatsapp",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@chatbotx.io/business": "workspace:*",
+    "@chatbotx.io/filesystem": "workspace:*",
+    "@chatbotx.io/flow-config": "workspace:*",
+    "@chatbotx.io/logger": "workspace:*",
+    "@chatbotx.io/sdk": "workspace:*",
+    "@chatbotx.io/utils": "workspace:*",
+    "@chatbotx.io/worker-config": "workspace:*",
+    "@edenchazard/tiny-chunk-array": "^1.0.1",
+    "@types/node": "catalog:",
+    "cross-fetch": "catalog:",
+    "ky": "catalog:",
+    "libphonenumber-js": "catalog:",
+    "remeda": "catalog:",
+    "whatsapp-api-js": "^6.2.1",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@chatbotx.io/typescript-config": "workspace:*",
+    "@chatbotx.io/vitest-config": "workspace:*",
+    "msw": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./api/*": "./src/api/*.ts",
+    "./constants": "./src/constants.ts",
+    "./test-handlers": "./src/test-handlers.ts",
+    "./exception": "./src/exception.ts"
+  },
+  "scripts": {
+    "check-types": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
+  }
+}

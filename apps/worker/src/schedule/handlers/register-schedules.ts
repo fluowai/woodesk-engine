@@ -1,0 +1,825 @@
+import { randomInt } from "node:crypto"
+import { channelTypes } from "@chatbotx.io/database/partials"
+import {
+  PURGE_BROADCASTS_INTERVAL_MINUTES,
+  PURGE_WORKSPACES_INTERVAL_MINUTES,
+  ScheduleJobData,
+  scheduleQueue,
+} from "@chatbotx.io/worker-config"
+import { Queue } from "bullmq"
+import { env } from "../../env"
+
+/**
+ * Quota/billing schedulers only make sense on the cloud edition. The trial
+ * teardown is the dangerous one: it disconnects every channel of an expired
+ * trial owner, and off-cloud there is no billing path to recover from that.
+ */
+/** Scheduler names of jobs that no longer exist (the AhaChat import sweeper). */
+const RETIRED_SCHEDULERS = ["scanAhachatImportRuns"] as const
+
+const CLOUD_ONLY_SCHEDULERS = [
+  ScheduleJobData.syncUserQuota,
+  ScheduleJobData.reconcileTenants,
+  ScheduleJobData.unsubscribeExpiredTrials,
+] as const
+
+const LICENSE_REFRESH_MINUTE = randomInt(60)
+
+/**
+ * Second of the minute each every-minute scanner fires at, so they do not all
+ * start at :00 (a CPU/DB spike on an idle worker). Jobs that read the minute
+ * boundary (`startOfMinute`) or start user-scheduled sends stay on
+ * "* * * * *" and are deliberately NOT listed here: enqueueBroadcast,
+ * enqueueRecurringBroadcasts, enqueueMarketingMessages, evaluateTriggers,
+ * evaluateDateTimeWebhooks.
+ */
+const EVERY_MINUTE_SECOND_OFFSETS = {
+  // Smallest offsets for the two deadline-driven jobs. Both already act up to
+  // a minute after the deadline (it falls on an arbitrary second), so this
+  // adds at most 2 s / 4 s to how late an overdue order expires or an overdue
+  // leaderboard finishes.
+  expireUnpaidOrders: 2,
+  finishOverdueLeaderboards: 4,
+  // Reads campaigns in status "sending", which the steps queued by
+  // enqueueMarketingMessages (kept at :00) set. Running a few seconds later
+  // lets a fast step land first; no ordering is required or guaranteed.
+  dispatchMarketingMessages: 8,
+  scanAbandonedCarts: 16,
+  reconcileBroadcasts: 20,
+  dispatchProfileSnapshots: 24,
+  scanCoexistRuns: 28,
+  scanContactScans: 32,
+  scanAiHandoverBulkRuns: 36,
+  scanContactSyncRuns: 38,
+  finalizeBroadcasts: 40,
+  finalizeMarketingMessages: 44,
+  reconcileMetaCatalogSyncs: 48,
+  pollSmtpInboxes: 52,
+} as const satisfies Partial<Record<keyof typeof ScheduleJobData, number>>
+
+// Job names (the values call sites pass) that have an offset. Intersecting with
+// the table keys makes a name/key mismatch a compile error, not a lookup miss.
+type SpreadEveryMinuteJob = keyof typeof EVERY_MINUTE_SECOND_OFFSETS &
+  (typeof ScheduleJobData)[keyof typeof ScheduleJobData]
+
+/** BullMQ cron (cron-parser) reads a 6-field pattern as seconds-first. */
+const everyMinuteAtOffset = (job: SpreadEveryMinuteJob): string =>
+  `${EVERY_MINUTE_SECOND_OFFSETS[job]} * * * * *`
+
+export const registerSchedules = async () => {
+  if (!(scheduleQueue instanceof Queue)) {
+    return
+  }
+
+  const isCloud = env.NEXT_PUBLIC_EDITION === "cloud"
+  if (!isCloud) {
+    // upsertJobScheduler persists in Redis: a scheduler registered by an
+    // earlier cloud boot (or a shared Redis) keeps firing until removed.
+    for (const name of CLOUD_ONLY_SCHEDULERS) {
+      await scheduleQueue.removeJobScheduler(name)
+    }
+  }
+
+  // Schedulers of removed jobs persist in Redis and would keep firing into an
+  // unknown job type.
+  for (const name of RETIRED_SCHEDULERS) {
+    await scheduleQueue.removeJobScheduler(name)
+  }
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.scanAbandonedCarts,
+    {
+      pattern: everyMinuteAtOffset(ScheduleJobData.scanAbandonedCarts),
+    },
+    {
+      name: ScheduleJobData.scanAbandonedCarts,
+      data: {
+        type: ScheduleJobData.scanAbandonedCarts,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.expireUnpaidOrders,
+    {
+      pattern: everyMinuteAtOffset(ScheduleJobData.expireUnpaidOrders),
+    },
+    {
+      name: ScheduleJobData.expireUnpaidOrders,
+      data: {
+        type: ScheduleJobData.expireUnpaidOrders,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.dispatchProfileSnapshots,
+    {
+      pattern: everyMinuteAtOffset(ScheduleJobData.dispatchProfileSnapshots),
+    },
+    {
+      name: ScheduleJobData.dispatchProfileSnapshots,
+      data: {
+        type: ScheduleJobData.dispatchProfileSnapshots,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.enqueueBroadcast,
+    {
+      pattern: "* * * * *",
+    },
+    {
+      name: ScheduleJobData.enqueueBroadcast,
+      data: {
+        type: ScheduleJobData.enqueueBroadcast,
+        data: {
+          schedulesAt: new Date(),
+        },
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.enqueueRecurringBroadcasts,
+    {
+      pattern: "* * * * *",
+    },
+    {
+      name: ScheduleJobData.enqueueRecurringBroadcasts,
+      data: {
+        type: ScheduleJobData.enqueueRecurringBroadcasts,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.finalizeBroadcasts,
+    {
+      pattern: everyMinuteAtOffset(ScheduleJobData.finalizeBroadcasts),
+    },
+    {
+      name: ScheduleJobData.finalizeBroadcasts,
+      data: {
+        type: ScheduleJobData.finalizeBroadcasts,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.reconcileBroadcasts,
+    {
+      pattern: everyMinuteAtOffset(ScheduleJobData.reconcileBroadcasts),
+    },
+    {
+      name: ScheduleJobData.reconcileBroadcasts,
+      data: {
+        type: ScheduleJobData.reconcileBroadcasts,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.enqueueMarketingMessages,
+    {
+      pattern: "* * * * *",
+    },
+    {
+      name: ScheduleJobData.enqueueMarketingMessages,
+      data: {
+        type: ScheduleJobData.enqueueMarketingMessages,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.dispatchMarketingMessages,
+    {
+      pattern: everyMinuteAtOffset(ScheduleJobData.dispatchMarketingMessages),
+    },
+    {
+      name: ScheduleJobData.dispatchMarketingMessages,
+      data: {
+        type: ScheduleJobData.dispatchMarketingMessages,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.finalizeMarketingMessages,
+    {
+      pattern: everyMinuteAtOffset(ScheduleJobData.finalizeMarketingMessages),
+    },
+    {
+      name: ScheduleJobData.finalizeMarketingMessages,
+      data: {
+        type: ScheduleJobData.finalizeMarketingMessages,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.evaluateTriggers,
+    {
+      pattern: "* * * * *",
+      // every: 5000,
+    },
+    {
+      name: ScheduleJobData.evaluateTriggers,
+      data: {
+        type: ScheduleJobData.evaluateTriggers,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.cleanupTriggers,
+    {
+      pattern: "0 3 * * *",
+    },
+    {
+      name: ScheduleJobData.cleanupTriggers,
+      data: {
+        type: ScheduleJobData.cleanupTriggers,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.evaluateDateTimeWebhooks,
+    {
+      pattern: "* * * * *",
+    },
+    {
+      name: ScheduleJobData.evaluateDateTimeWebhooks,
+      data: {
+        type: ScheduleJobData.evaluateDateTimeWebhooks,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.cleanupWebhookExecutions,
+    {
+      pattern: "0 4 * * *",
+    },
+    {
+      name: ScheduleJobData.cleanupWebhookExecutions,
+      data: {
+        type: ScheduleJobData.cleanupWebhookExecutions,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.scanSmartDelay,
+    {
+      pattern: "*/5 * * * *",
+    },
+    {
+      name: ScheduleJobData.scanSmartDelay,
+      data: {
+        type: ScheduleJobData.scanSmartDelay,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.scanAppointmentReminders,
+    {
+      pattern: "*/5 * * * *",
+    },
+    {
+      name: ScheduleJobData.scanAppointmentReminders,
+      data: {
+        type: ScheduleJobData.scanAppointmentReminders,
+        data: {
+          triggeredAt: new Date().toISOString(),
+        },
+      },
+    },
+  )
+
+  if (isCloud) {
+    await scheduleQueue.upsertJobScheduler(
+      ScheduleJobData.syncUserQuota,
+      { every: env.QUOTA_SYNC_INTERVAL_SECONDS * 1000 },
+      {
+        name: ScheduleJobData.syncUserQuota,
+        data: { type: ScheduleJobData.syncUserQuota, data: {} },
+      },
+    )
+
+    await scheduleQueue.upsertJobScheduler(
+      ScheduleJobData.reconcileTenants,
+      { every: env.QUOTA_SYNC_INTERVAL_SECONDS * 1000 },
+      {
+        name: ScheduleJobData.reconcileTenants,
+        data: { type: ScheduleJobData.reconcileTenants, data: {} },
+      },
+    )
+  }
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.maintainMacPartitions,
+    {
+      pattern: "0 1 * * *",
+    },
+    {
+      name: ScheduleJobData.maintainMacPartitions,
+      data: {
+        type: ScheduleJobData.maintainMacPartitions,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.maintainLeaderboardPartitions,
+    {
+      pattern: "20 1 * * *",
+    },
+    {
+      name: ScheduleJobData.maintainLeaderboardPartitions,
+      data: {
+        type: ScheduleJobData.maintainLeaderboardPartitions,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.finishOverdueLeaderboards,
+    {
+      pattern: everyMinuteAtOffset(ScheduleJobData.finishOverdueLeaderboards),
+    },
+    {
+      name: ScheduleJobData.finishOverdueLeaderboards,
+      data: {
+        type: ScheduleJobData.finishOverdueLeaderboards,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.maintainLeaderboardRankings,
+    {
+      // Minute 1 so a 22:00 reset rebuilds right after the day rolls over.
+      pattern: "1 * * * *",
+    },
+    {
+      name: ScheduleJobData.maintainLeaderboardRankings,
+      data: {
+        type: ScheduleJobData.maintainLeaderboardRankings,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.scanCoexistRuns,
+    {
+      pattern: everyMinuteAtOffset(ScheduleJobData.scanCoexistRuns),
+    },
+    {
+      name: ScheduleJobData.scanCoexistRuns,
+      data: {
+        type: ScheduleJobData.scanCoexistRuns,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.scanContactScans,
+    {
+      pattern: everyMinuteAtOffset(ScheduleJobData.scanContactScans),
+    },
+    {
+      name: ScheduleJobData.scanContactScans,
+      data: {
+        type: ScheduleJobData.scanContactScans,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.pollSmtpInboxes,
+    {
+      pattern: everyMinuteAtOffset(ScheduleJobData.pollSmtpInboxes),
+    },
+    {
+      name: ScheduleJobData.pollSmtpInboxes,
+      data: {
+        type: ScheduleJobData.pollSmtpInboxes,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.scanContactSyncRuns,
+    {
+      pattern: everyMinuteAtOffset(ScheduleJobData.scanContactSyncRuns),
+    },
+    {
+      name: ScheduleJobData.scanContactSyncRuns,
+      data: {
+        type: ScheduleJobData.scanContactSyncRuns,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.scanAiHandoverBulkRuns,
+    {
+      pattern: everyMinuteAtOffset(ScheduleJobData.scanAiHandoverBulkRuns),
+    },
+    {
+      name: ScheduleJobData.scanAiHandoverBulkRuns,
+      data: {
+        type: ScheduleJobData.scanAiHandoverBulkRuns,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.reconcileMetaCatalogSyncs,
+    {
+      pattern: everyMinuteAtOffset(ScheduleJobData.reconcileMetaCatalogSyncs),
+    },
+    {
+      name: ScheduleJobData.reconcileMetaCatalogSyncs,
+      data: {
+        type: ScheduleJobData.reconcileMetaCatalogSyncs,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.purgeCoexistStaging,
+    {
+      pattern: "0 * * * *",
+    },
+    {
+      name: ScheduleJobData.purgeCoexistStaging,
+      data: {
+        type: ScheduleJobData.purgeCoexistStaging,
+        data: {},
+      },
+    },
+  )
+
+  // Deliberately NOT in CLOUD_ONLY_SCHEDULERS — retention applies to every
+  // edition.
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.purgeErrorLogs,
+    {
+      pattern: "0 3 * * *",
+    },
+    {
+      name: ScheduleJobData.purgeErrorLogs,
+      data: {
+        type: ScheduleJobData.purgeErrorLogs,
+        data: {},
+      },
+    },
+  )
+
+  // The inbound-webhook outbox sweep and its retention apply to every edition.
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.redispatchInboundWebhookRequests,
+    {
+      pattern: "*/5 * * * *",
+    },
+    {
+      name: ScheduleJobData.redispatchInboundWebhookRequests,
+      data: {
+        type: ScheduleJobData.redispatchInboundWebhookRequests,
+        data: {},
+      },
+    },
+  )
+
+  // The template-install outbox sweep (the row is the outbox) applies to
+  // every edition.
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.redispatchTemplateJobs,
+    {
+      pattern: "*/5 * * * *",
+    },
+    {
+      name: ScheduleJobData.redispatchTemplateJobs,
+      data: {
+        type: ScheduleJobData.redispatchTemplateJobs,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.purgeInboundWebhookRequests,
+    {
+      pattern: "30 3 * * *",
+    },
+    {
+      name: ScheduleJobData.purgeInboundWebhookRequests,
+      data: {
+        type: ScheduleJobData.purgeInboundWebhookRequests,
+        data: {},
+      },
+    },
+  )
+
+  // Same "retention applies to every edition" reasoning as `purgeErrorLogs`
+  // above; offset 15 minutes so the two chunked deletes do not contend.
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.purgeCommentAutomationEvents,
+    {
+      pattern: "15 3 * * *",
+    },
+    {
+      name: ScheduleJobData.purgeCommentAutomationEvents,
+      data: {
+        type: ScheduleJobData.purgeCommentAutomationEvents,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.purgeWhatsappSignupSessions,
+    {
+      pattern: "0 * * * *",
+    },
+    {
+      name: ScheduleJobData.purgeWhatsappSignupSessions,
+      data: {
+        type: ScheduleJobData.purgeWhatsappSignupSessions,
+        data: {},
+      },
+    },
+  )
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.purgeExpiredConnectSessions,
+    {
+      pattern: "0 * * * *",
+    },
+    {
+      name: ScheduleJobData.purgeExpiredConnectSessions,
+      data: {
+        type: ScheduleJobData.purgeExpiredConnectSessions,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.purgeWorkspaces,
+    {
+      pattern: `*/${PURGE_WORKSPACES_INTERVAL_MINUTES} * * * *`,
+    },
+    {
+      name: ScheduleJobData.purgeWorkspaces,
+      data: {
+        type: ScheduleJobData.purgeWorkspaces,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.purgeDeletedUsers,
+    {
+      pattern: `*/${PURGE_WORKSPACES_INTERVAL_MINUTES} * * * *`,
+    },
+    {
+      name: ScheduleJobData.purgeDeletedUsers,
+      data: {
+        type: ScheduleJobData.purgeDeletedUsers,
+        data: {},
+      },
+    },
+  )
+
+  // Access is already gated by comparing `supportAccessUntil > now()` on
+  // every read, so this cron only tidies the stale timestamp for
+  // display/reporting hygiene — daily is plenty.
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.clearExpiredSupportAccess,
+    {
+      pattern: "0 3 * * *",
+    },
+    {
+      name: ScheduleJobData.clearExpiredSupportAccess,
+      data: {
+        type: ScheduleJobData.clearExpiredSupportAccess,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.googleAdsHousekeeping,
+    { pattern: "*/10 * * * *" },
+    {
+      name: ScheduleJobData.googleAdsHousekeeping,
+      data: {
+        type: ScheduleJobData.googleAdsHousekeeping,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.googleAdsSyncSetups,
+    { pattern: "30 3 * * *" },
+    {
+      name: ScheduleJobData.googleAdsSyncSetups,
+      data: {
+        type: ScheduleJobData.googleAdsSyncSetups,
+        data: {},
+      },
+    },
+  )
+
+  // Better Auth retains every refreshed OAuth token row, so daily retention
+  // prevents active MCP connections from growing the table unboundedly.
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.purgeExpiredOAuthTokens,
+    {
+      pattern: "0 4 * * *",
+    },
+    {
+      name: ScheduleJobData.purgeExpiredOAuthTokens,
+      data: {
+        type: ScheduleJobData.purgeExpiredOAuthTokens,
+        data: {},
+      },
+    },
+  )
+
+  // Deliberately NOT in CLOUD_ONLY_SCHEDULERS — recipient-row retention
+  // applies to every edition.
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.purgeBroadcasts,
+    {
+      pattern: `*/${PURGE_BROADCASTS_INTERVAL_MINUTES} * * * *`,
+    },
+    {
+      name: ScheduleJobData.purgeBroadcasts,
+      data: {
+        type: ScheduleJobData.purgeBroadcasts,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.purgeAutomationThrottle,
+    {
+      pattern: "0 * * * *",
+    },
+    {
+      name: ScheduleJobData.purgeAutomationThrottle,
+      data: {
+        type: ScheduleJobData.purgeAutomationThrottle,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.refreshChannelTokens,
+    {
+      pattern: "0 2 * * *",
+    },
+    {
+      name: ScheduleJobData.refreshChannelTokens,
+      data: {
+        type: ScheduleJobData.refreshChannelTokens,
+        data: {},
+      },
+    },
+  )
+
+  // Zalo and TikTok tokens only live ~24-25h, so the single 02:00 run leaves
+  // almost no margin: one missed run and they expire mid-day. This extra
+  // midday run keeps them at most ~12h from a refresh; the long-lived
+  // Meta/WhatsApp tokens stay on the daily run above.
+  await scheduleQueue.upsertJobScheduler(
+    "refreshShortLivedChannelTokens",
+    {
+      pattern: "0 14 * * *",
+    },
+    {
+      name: ScheduleJobData.refreshChannelTokens,
+      data: {
+        type: ScheduleJobData.refreshChannelTokens,
+        data: {
+          channels: [channelTypes.enum.zalo, channelTypes.enum.tiktok],
+        },
+      },
+    },
+  )
+
+  if (env.NEXT_PUBLIC_EDITION === "community") {
+    // upsertJobScheduler persists in Redis: a scheduler left by an earlier
+    // licensed boot keeps firing after a downgrade until it is removed.
+    await scheduleQueue.removeJobScheduler(ScheduleJobData.refreshLicense)
+  } else {
+    await scheduleQueue.upsertJobScheduler(
+      ScheduleJobData.refreshLicense,
+      {
+        pattern: `${LICENSE_REFRESH_MINUTE} * * * *`,
+      },
+      {
+        name: ScheduleJobData.refreshLicense,
+        data: {
+          type: ScheduleJobData.refreshLicense,
+          data: {},
+        },
+      },
+    )
+  }
+
+  if (isCloud) {
+    await scheduleQueue.upsertJobScheduler(
+      ScheduleJobData.unsubscribeExpiredTrials,
+      {
+        pattern: "0 * * * *",
+      },
+      {
+        name: ScheduleJobData.unsubscribeExpiredTrials,
+        data: {
+          type: ScheduleJobData.unsubscribeExpiredTrials,
+          data: {},
+        },
+      },
+    )
+  }
+
+  // Contact exports hold email and phone numbers, so they are not kept forever.
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.purgeExpiredContactExports,
+    {
+      pattern: "30 4 * * *",
+    },
+    {
+      name: ScheduleJobData.purgeExpiredContactExports,
+      data: {
+        type: ScheduleJobData.purgeExpiredContactExports,
+        data: {},
+      },
+    },
+  )
+
+  // WhatsApp calling.
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.purgeExpiredCallRecordings,
+    {
+      pattern: "0 5 * * *",
+    },
+    {
+      name: ScheduleJobData.purgeExpiredCallRecordings,
+      data: {
+        type: ScheduleJobData.purgeExpiredCallRecordings,
+        data: {},
+      },
+    },
+  )
+
+  await scheduleQueue.upsertJobScheduler(
+    ScheduleJobData.sweepStaleWhatsappCalls,
+    {
+      pattern: "*/5 * * * *",
+    },
+    {
+      name: ScheduleJobData.sweepStaleWhatsappCalls,
+      data: {
+        type: ScheduleJobData.sweepStaleWhatsappCalls,
+        data: {},
+      },
+    },
+  )
+}

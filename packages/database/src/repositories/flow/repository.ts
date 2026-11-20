@@ -1,0 +1,213 @@
+import { type DatabaseClient, db, relationsFilterToSQL } from "../../client"
+import { rootFolderId } from "../../partials"
+import { flowModel } from "../../schema"
+import {
+  escapeLikePattern,
+  likeContains,
+  parseOrderByAsObject,
+  parsePagination,
+} from "../../utils"
+
+export type FlowListInput = {
+  workspaceId: string
+  name?: string | null
+  folderId?: string | null
+  active?: boolean | null
+  /** Restrict to flows an agent may start from the inbox (`enableInInbox`). */
+  enableInInbox?: boolean | null
+  page?: number | null
+  perPage?: number | null
+  sort?: { id: string; desc: boolean }[] | null
+}
+
+const buildWhere = (input: FlowListInput) => ({
+  workspaceId: input.workspaceId,
+  folderId: input.folderId
+    ? // biome-ignore lint/style/noNestedTernary: mirrors the original builder query verbatim
+      input.folderId === rootFolderId
+      ? { isNull: true as const }
+      : input.folderId
+    : undefined,
+  name: input.name ? { ilike: likeContains(input.name) } : undefined,
+  active: input.active === null ? undefined : (input.active ?? undefined),
+  enableInInbox:
+    input.enableInInbox === null
+      ? undefined
+      : (input.enableInInbox ?? undefined),
+})
+
+export const flowRepository = {
+  /** Names of the workspace's flows starting with `prefix` (taken as plain text). */
+  async listNamesWithPrefix(
+    input: { workspaceId: string; prefix: string },
+    tx: DatabaseClient = db,
+  ): Promise<string[]> {
+    const rows = await tx.query.flowModel.findMany({
+      where: {
+        workspaceId: input.workspaceId,
+        name: { like: `${escapeLikePattern(input.prefix)}%` },
+      },
+      columns: { name: true },
+    })
+    return rows.map((row) => row.name)
+  },
+
+  /** Whether a flow with this id exists in the workspace (id-only read). */
+  async existsInWorkspace(
+    input: { workspaceId: string; id: string },
+    tx: DatabaseClient = db,
+  ): Promise<boolean> {
+    const row = await tx.query.flowModel.findFirst({
+      where: { id: input.id, workspaceId: input.workspaceId },
+      columns: { id: true },
+    })
+    return Boolean(row)
+  },
+
+  /** Minimal published, active flow projection for action target pickers. */
+  async listPublishedOptions(
+    input: { workspaceId: string },
+    tx: DatabaseClient = db,
+  ): Promise<Array<{ id: string; name: string }>> {
+    return await tx.query.flowModel.findMany({
+      where: {
+        workspaceId: input.workspaceId,
+        active: true,
+        currentVersionId: { isNotNull: true },
+      },
+      columns: { id: true, name: true },
+    })
+  },
+
+  /**
+   * Paginated flow list with each row's draft + latest version attached.
+   * The `with` literal stays inline so Drizzle's relational-query type
+   * inference survives into `ListFlowsResponse` — do not hoist it out.
+   */
+  async listWithVersions(input: FlowListInput, tx: DatabaseClient = db) {
+    const where = buildWhere(input)
+    const pagination = parsePagination(input)
+    const orderBy = parseOrderByAsObject(flowModel, input)
+
+    return await tx.query.flowModel.findMany({
+      where,
+      orderBy,
+      ...pagination,
+      with: {
+        flowVersions: {
+          where: {
+            OR: [{ isDraft: true }, { isLatest: true }],
+          },
+        },
+      },
+    })
+  },
+
+  async count(input: FlowListInput, tx: DatabaseClient = db): Promise<number> {
+    const where = buildWhere(input)
+    return await tx.$count(flowModel, relationsFilterToSQL(flowModel, where))
+  },
+
+  /** Flow detail with all versions — used by flowService.findById. */
+  async findWithVersions(
+    input: { workspaceId: string; id: string },
+    tx: DatabaseClient = db,
+  ) {
+    return await tx.query.flowModel.findFirst({
+      where: {
+        workspaceId: input.workspaceId,
+        id: input.id,
+      },
+      with: {
+        flowVersions: true,
+      },
+    })
+  },
+
+  /**
+   * The nodes of the flow's published (current) version: `undefined` when the
+   * flow does not exist in the workspace, `[]` when it has no published
+   * version yet.
+   */
+  async findCurrentVersionNodes(
+    input: { workspaceId: string; flowId: string },
+    tx: DatabaseClient = db,
+  ) {
+    const flow = await tx.query.flowModel.findFirst({
+      where: { workspaceId: input.workspaceId, id: input.flowId },
+      columns: { currentVersionId: true },
+    })
+    if (!flow) {
+      return
+    }
+    if (!flow.currentVersionId) {
+      return []
+    }
+
+    const version = await tx.query.flowVersionModel.findFirst({
+      where: {
+        id: flow.currentVersionId,
+        flowId: input.flowId,
+        workspaceId: input.workspaceId,
+      },
+      columns: { nodes: true },
+    })
+    return version?.nodes ?? []
+  },
+
+  /**
+   * Name and published-version nodes of the given flows (a flow without a
+   * published version has no nodes). Flows that do not exist in the workspace
+   * are absent. Two primary-key lookups, so it costs the number of flows asked
+   * for, not the number in the workspace.
+   */
+  async listCurrentVersionNodesByFlowIds(
+    input: { workspaceId: string; flowIds: string[] },
+    tx: DatabaseClient = db,
+  ) {
+    if (input.flowIds.length === 0) {
+      return []
+    }
+
+    const flows = await tx.query.flowModel.findMany({
+      where: { workspaceId: input.workspaceId, id: { in: input.flowIds } },
+      columns: { id: true, name: true, currentVersionId: true },
+    })
+    const versionIds = flows.flatMap((flow) =>
+      flow.currentVersionId ? [flow.currentVersionId] : [],
+    )
+    const versions =
+      versionIds.length === 0
+        ? []
+        : await tx.query.flowVersionModel.findMany({
+            where: { workspaceId: input.workspaceId, id: { in: versionIds } },
+            columns: { id: true, nodes: true },
+          })
+    const nodesByVersionId = new Map(
+      versions.map((version) => [version.id, version.nodes]),
+    )
+
+    return flows.map((flow) => ({
+      flowId: flow.id,
+      flowName: flow.name,
+      nodes: flow.currentVersionId
+        ? (nodesByVersionId.get(flow.currentVersionId) ?? [])
+        : [],
+    }))
+  },
+
+  /** Existence check for a set of flow ids, scoped to the workspace. */
+  async listIdsByIds(
+    input: { workspaceId: string; ids: string[] },
+    tx: DatabaseClient = db,
+  ): Promise<string[]> {
+    const rows = await tx.query.flowModel.findMany({
+      where: {
+        workspaceId: input.workspaceId,
+        id: { in: input.ids },
+      },
+      columns: { id: true },
+    })
+    return rows.map((row) => row.id)
+  },
+}

@@ -1,0 +1,1069 @@
+import {
+  checksSchema,
+  registerSchemaCheck,
+  schemaCheckFor,
+} from "@better-auth/core/db/internal"
+import { mcp } from "@better-auth/mcp"
+import {
+  customDomainService,
+  mobileRefreshTokenService,
+  type PlatformSmtpTransport,
+  platformCredentialService,
+  resolvePlatformSmtpTransport,
+  resolveTenantSettingsByDomain,
+  toSmtpTransport,
+  userService,
+} from "@chatbotx.io/business"
+import { ChatbotXException } from "@chatbotx.io/business/errors"
+import { db } from "@chatbotx.io/database/client"
+import {
+  accountModel,
+  jwkModel,
+  oauthAccessTokenModel,
+  oauthClientAssertionModel,
+  oauthClientModel,
+  oauthClientResourceModel,
+  oauthConsentModel,
+  oauthRefreshTokenModel,
+  oauthResourceModel,
+  ROOT_TENANT_ID,
+  sessionModel,
+  userModel,
+  verificationModel,
+} from "@chatbotx.io/database/schema"
+import {
+  DEFAULT_FORGOT_PASSWORD_SUBJECT,
+  DEFAULT_MAGIC_LINK_SUBJECT,
+  DEFAULT_SIGNUP_SUBJECT,
+  sendMagicLink,
+  sendResetPassword,
+  sendSignUpVerification,
+} from "@chatbotx.io/mail"
+import { createId, getPublicOriginFromRequest } from "@chatbotx.io/utils"
+import {
+  isPlaceholderEmail,
+  mapFacebookProfileToUser,
+} from "@chatbotx.io/utils/placeholder-email"
+import { APIError, betterAuth } from "better-auth"
+import { drizzleAdapter } from "better-auth/adapters/drizzle"
+import { createAuthMiddleware } from "better-auth/api"
+import { nextCookies } from "better-auth/next-js"
+import {
+  anonymous,
+  bearer,
+  genericOAuth,
+  jwt,
+  magicLink,
+  oneTimeToken,
+} from "better-auth/plugins"
+import { PHASE_PRODUCTION_BUILD } from "next/constants"
+import { createAppleIdTokenVerifier } from "./apple-id-token"
+import { claimUnverifiedAccountBeforeLink } from "./claim-unverified-account"
+import { resolveGenericOAuthConfig } from "./generic-oauth"
+import {
+  env,
+  getAppleAppBundleIds,
+  getBrokerUrl,
+  getBuilderOrigin,
+  getMcpResourceUrl,
+} from "./keys"
+import { logger } from "./logger"
+import { buildMcpPluginOptions, defaultMcpResource } from "./mcp-config"
+import { mobileAuth } from "./mobile-auth"
+import { GENERIC_OAUTH_PROVIDER_ID } from "./oauth-constants"
+import {
+  isSignUpAllowed,
+  SIGNUP_DISABLED_CODE,
+  type SignUpGateContext,
+} from "./signup-gate"
+import { getTenantId, resolveTenantOwnerId } from "./tenant-context"
+import { assertNotTenantOwnerEmail } from "./tenant-owner-email"
+
+const NATIVE_ONLY_PROVIDERS: Record<string, true> = { apple: true }
+
+const getTenantSettings = async (request: Request) => {
+  const domain = request.headers.get("x-domain") ?? ""
+  return await resolveTenantSettingsByDomain(domain)
+}
+
+type SmtpResolution =
+  | { kind: "default" }
+  | {
+      kind: "transport"
+      transport: PlatformSmtpTransport
+    }
+  | { kind: "blocked" }
+
+const resolveSmtpForTenant = async (): Promise<SmtpResolution> => {
+  const tenantId = getTenantId()
+  const ownerId = await resolveTenantOwnerId(tenantId)
+  if (!ownerId) {
+    const platformTransport = await resolvePlatformSmtpTransport()
+    return platformTransport
+      ? { kind: "transport", transport: platformTransport }
+      : { kind: "default" }
+  }
+
+  const smtp = await platformCredentialService.findDecryptedForUser({
+    userId: ownerId,
+    type: "smtp",
+  })
+  if (!smtp) {
+    logger.warn(
+      { tenantId, ownerId },
+      "Reseller has no SMTP credential configured; skipping auth email send",
+    )
+    return { kind: "blocked" }
+  }
+
+  return {
+    kind: "transport",
+    transport: toSmtpTransport(smtp.config),
+  }
+}
+
+type AdapterFactory = ReturnType<typeof drizzleAdapter>
+type AuthAdapter = ReturnType<AdapterFactory>
+type WhereClause = Parameters<AuthAdapter["findOne"]>[0]["where"][number]
+
+/**
+ * Match a reseller owner's own account, which lives in the ROOT tenant (they
+ * signed up on the main site). Shared by the reseller-owner fallback in the
+ * adapter; the magic-link gate mirrors it in Drizzle relational form.
+ */
+const ownerRootClauses = (ownerId: string): WhereClause[] => [
+  { field: "id", value: ownerId },
+  { field: "tenantId", value: ROOT_TENANT_ID },
+]
+
+/**
+ * Wrap the drizzle adapter so white-label isolation holds at the data layer:
+ * every `User` lookup *by email* and every `User` insert is constrained to the
+ * current tenant (`getTenantId()` — `ROOT_TENANT_ID` = platform). Lookups by
+ * id/token are untouched, so sessions stay tenant-neutral. This is what lets the
+ * same email exist as fully separate accounts across tenants.
+ */
+export function createTenantScopedAdapter(
+  base: AdapterFactory,
+): AdapterFactory {
+  // Constrain a lookup to the current tenant so white-label accounts stay
+  // isolated:
+  //   • `user` lookups *by email* — the same email is a separate account per
+  //     tenant.
+  //   • `account` lookups *by social identity* (`accountId` without `userId`) —
+  //     the same provider identity links to a separate account row per tenant,
+  //     so sub-accounts stay isolated. The reseller owner's own row is stamped
+  //     `ROOT_TENANT_ID` (see `create` below) and so misses here on their domain;
+  //     better-auth then falls through to the email lookup, where the
+  //     reseller-owner fallback resolves their root-tenant account.
+  // Lookups by id/token/userId are left untouched, so sessions, a user's own
+  // account list, and credential lookups stay tenant-neutral. Credential
+  // lookups use `userId` and therefore already identify one user; adding a
+  // tenant predicate would hide a reseller credential from server actions that
+  // run in the root tenant.
+  const scopeByTenant = (
+    model: string,
+    where: WhereClause[] | undefined,
+  ): WhereClause[] | undefined => {
+    if (!where || where.some((clause) => clause.field === "tenantId")) {
+      return where
+    }
+    const scopesUserByEmail =
+      model === "user" && where.some((clause) => clause.field === "email")
+    const scopesAccountByIdentity =
+      model === "account" &&
+      where.some((clause) => clause.field === "accountId") &&
+      !where.some((clause) => clause.field === "userId")
+    if (!(scopesUserByEmail || scopesAccountByIdentity)) {
+      return where
+    }
+    return [...where, { field: "tenantId", value: getTenantId() }]
+  }
+
+  // Apply the tenant overrides to an adapter. Recursive via `transaction`: when
+  // better-auth runs a write inside `runWithTransaction`, it resolves the active
+  // adapter from the `trx` this callback receives (`getCurrentAdapter`), NOT the
+  // outer wrapped adapter. With transactions disabled the base adapter hands back
+  // *itself* as `trx`, so without re-wrapping it the user/account insert would run
+  // unwrapped and skip the `tenantId` stamp — leaving the column at its root-tenant
+  // default. Re-wrapping `trx` keeps scoping and stamping intact inside writes.
+  const wrapAdapter = (adapter: AuthAdapter): AuthAdapter => {
+    const baseTransaction = adapter.transaction
+    const wrappedTransaction =
+      typeof baseTransaction === "function"
+        ? ((<R>(callback: (trx: AuthAdapter) => Promise<R>) =>
+            baseTransaction((trx) =>
+              callback(wrapAdapter(trx as AuthAdapter)),
+            )) as AuthAdapter["transaction"])
+        : baseTransaction
+    return {
+      ...adapter,
+      transaction: wrappedTransaction,
+      findOne: async <T>(data: Parameters<AuthAdapter["findOne"]>[0]) => {
+        const result = await adapter.findOne<T>({
+          ...data,
+          where: scopeByTenant(data.model, data.where) ?? data.where,
+        })
+        if (result || data.model !== "user" || !data.where) {
+          return result
+        }
+        // Reseller-owner fallback: on the reseller's own custom domain the bound
+        // tenant is their reseller `Tenant`, but the reseller's account lives in
+        // the root tenant (they signed up on the main site) and so is missed by
+        // the scoped lookup above. Resolve the bound tenant's owner and retry by
+        // primary key, additionally constrained to the ROOT tenant — the fallback
+        // resolves only the owner's root-tenant account, never a user parked in
+        // any other tenant. `Tenant.ownerId` resolves only this tenant's owner —
+        // never another tenant's user — and `id` is unique, so the match is exact.
+        // Sub-account lookups are tried first, so they keep priority.
+        //
+        // Applies to every email lookup, including the OAuth social path: a social
+        // sign-in with the owner's email links to the owner's root-tenant account
+        // (via better-auth account linking, `trustedProviders` below) instead of
+        // creating a tenant-scoped duplicate. Both social providers verify mailbox
+        // ownership, so whoever presents the owner's email via OAuth is the owner.
+        const filtersByEmail = data.where.some(
+          (clause) => clause.field === "email",
+        )
+        if (!filtersByEmail) {
+          return result
+        }
+        const tenantId = getTenantId()
+        const ownerId = await resolveTenantOwnerId(tenantId)
+        if (ownerId) {
+          const ownerWhere: WhereClause[] = [
+            ...data.where.filter((clause) => clause.field !== "tenantId"),
+            ...ownerRootClauses(ownerId),
+          ]
+          return adapter.findOne<T>({ ...data, where: ownerWhere })
+        }
+        return result
+      },
+      findMany: <T>(data: Parameters<AuthAdapter["findMany"]>[0]) =>
+        adapter.findMany<T>({
+          ...data,
+          where: scopeByTenant(data.model, data.where),
+        }),
+      count: (data: Parameters<AuthAdapter["count"]>[0]) =>
+        adapter.count({
+          ...data,
+          where: scopeByTenant(data.model, data.where),
+        }),
+      // Stamp the bound tenant on every `user` and `account` insert so a row's
+      // ownership matches the tenant it was created under. `tenantId` is declared
+      // as a (non-input) field on both models so better-auth keeps the value.
+      //
+      // Exception: an `account` row linking to the bound tenant's OWNER (matched
+      // via the cache-backed `resolveTenantOwnerId`) is stamped `ROOT_TENANT_ID`
+      // instead — the owner's first social sign-in on their own reseller domain
+      // creates this row for their root-tenant `User`, and `Account.tenantId` has
+      // `onDelete: "restrict"`, so stamping the reseller tenant here would leave a
+      // row that blocks that tenant's deletion while referencing a root-tenant
+      // user. See `auth-account.ts` and the reseller-owner fallback above.
+      create: async <T extends Record<string, unknown>, R = T>(data: {
+        model: string
+        data: Omit<T, "id">
+        select?: string[]
+        forceAllowId?: boolean
+      }) => {
+        if (data.model !== "user" && data.model !== "account") {
+          return adapter.create<T, R>(data)
+        }
+        const tenantId = getTenantId()
+        const ownerId =
+          data.model === "account" ? await resolveTenantOwnerId(tenantId) : null
+        const isOwnerAccount = ownerId !== null && data.data.userId === ownerId
+        return adapter.create<T, R>({
+          ...data,
+          data: {
+            ...data.data,
+            tenantId: isOwnerAccount ? ROOT_TENANT_ID : tenantId,
+          },
+        })
+      },
+    }
+  }
+
+  return (options) => {
+    const inner = base(options)
+    const wrapped = wrapAdapter(inner)
+    const schemaCheck = schemaCheckFor(inner)
+    if (schemaCheck) {
+      registerSchemaCheck(wrapped, schemaCheck, {
+        runtimeEnabled: checksSchema(options),
+      })
+    }
+    return wrapped
+  }
+}
+
+/**
+ * Repo ids are 64-bit snowflakes (`createId`) that passed 2^53 in 2021. Never
+ * use `generateId: "serial"` here: that flag makes better-auth's adapter
+ * factory wrap every id and id reference (`Account.userId`, `Session.userId`)
+ * in `Number()`, which rounds every odd id to its even neighbour — sessions and
+ * linked accounts then land on the wrong user, or fail the FK when the
+ * neighbour does not exist. A function generator keeps ids as the strings
+ * `bigintAsString` already models.
+ */
+export const AUTH_DATABASE_OPTIONS = {
+  generateId: () => createId(),
+} as const
+
+/** A social provider better-auth can sign users in with (white-label per tenant). */
+export const SOCIAL_PROVIDERS = ["google", "facebook"] as const
+export type SocialProvider = (typeof SOCIAL_PROVIDERS)[number]
+
+/**
+ * A fixed OAuth app (client id + secret) for one provider on a single auth
+ * instance. Resolved per tenant ahead of building the instance — better-auth
+ * freezes social-provider config at init (the `socialProviders` thunk runs once,
+ * with no request/tenant context), so the only way to give each white-label
+ * tenant its own provider app is to build a separate auth instance per
+ * credential. See `apps/builder` `auth-instances.ts`.
+ */
+export type SocialAuthCredential = {
+  clientId: string
+  clientSecret: string
+}
+
+/**
+ * The newly persisted `User` row handed to `onUserCreated`, narrowed to the
+ * fields the builder needs to provision a default plan. `tenantId` is the
+ * white-label tenant the account was created under (stamped by the adapter);
+ * `isAnonymous` marks throwaway accounts from the `anonymous` plugin.
+ */
+export type AuthCreatedUser = {
+  id: string
+  email: string
+  tenantId?: string
+  isAnonymous?: boolean
+}
+
+/**
+ * A patch an `upgradeOAuthAccount` hook may apply to an OAuth `Account` row
+ * before better-auth persists it (e.g. swapping a short-lived token for a
+ * long-lived one).
+ */
+export type AuthOAuthAccountPatch = {
+  accessToken?: string | null
+  accessTokenExpiresAt?: Date | null
+}
+
+/** The subset of an `Account` row an `upgradeOAuthAccount` hook can inspect. */
+export type AuthOAuthAccount = {
+  providerId: string
+  accessToken: string | null
+}
+
+export type AuthConfig = {
+  /**
+   * The per-provider OAuth apps this instance signs in with. A provider is
+   * enabled only when its credential is present; omit/`null` to disable it.
+   */
+  socialCredentials?: Partial<
+    Record<SocialProvider, SocialAuthCredential | null>
+  >
+  /**
+   * Extra scopes requested at authorize time for a provider, REPLACING (not
+   * appending to) better-auth's own default scope list — packages/auth has no
+   * opinion on what the scopes mean; the caller (builder) supplies them.
+   */
+  socialScopes?: Partial<Record<SocialProvider, string[]>>
+  /**
+   * Called from `account.create.before` / `account.update.before`, right
+   * before better-auth persists an OAuth account row — on every social
+   * sign-in, not just the first. Return a patch to upgrade the row before it's
+   * written (e.g. Facebook short-lived → long-lived token exchange).
+   * Best-effort: errors are caught and the original data is persisted
+   * unmodified. Omit to disable.
+   */
+  upgradeOAuthAccount?: (
+    account: AuthOAuthAccount,
+  ) => Promise<AuthOAuthAccountPatch | undefined>
+  /**
+   * Called once after a new `User` row is created, on every sign-up path
+   * (email/password, social, magic link). The builder wires this to provision
+   * the user's default plan via the billing portal (cloud only). Best-effort:
+   * the hook catches any error so provisioning never aborts sign-up. Omit
+   * (self-hosted, tests) to disable.
+   */
+  onUserCreated?: (user: AuthCreatedUser) => Promise<void> | void
+  /**
+   * Origin to pin social `redirectURI`s to, in place of the broker. The
+   * builder passes the reseller's active custom domain for a tenant-owned
+   * credential; omit to keep the broker (inherited/platform credentials,
+   * self-hosted).
+   */
+  socialRedirectOrigin?: string
+}
+
+/**
+ * Native Sign in with Apple, verified only by `POST /mobile/token` (`id_token`
+ * grant). Web social and callback paths are blocked by `guardAuthEntryPoints`.
+ */
+function buildAppleProvider() {
+  const bundleIds = getAppleAppBundleIds()
+  const [primaryBundleId] = bundleIds
+  if (!primaryBundleId) {
+    return
+  }
+  return {
+    clientId: primaryBundleId,
+    clientSecret: "",
+    audience: bundleIds,
+    appBundleIdentifier: primaryBundleId,
+    verifyIdToken: createAppleIdTokenVerifier(bundleIds),
+  }
+}
+
+/**
+ * Build the `socialProviders` config from the resolved per-provider credentials.
+ * Returns `undefined` (all social disabled) during the production build phase —
+ * the thunk runs without request context then — or when nothing resolved.
+ */
+function buildSocialProviders(
+  socialCredentials: AuthConfig["socialCredentials"],
+  socialScopes: AuthConfig["socialScopes"],
+  redirectOrigin: AuthConfig["socialRedirectOrigin"],
+) {
+  if (process.env.NEXT_PHASE === PHASE_PRODUCTION_BUILD) {
+    return
+  }
+
+  type ProviderOptions = {
+    enabled: true
+    redirectURI: string
+    scope?: string[]
+    disableDefaultScope?: boolean
+  } & SocialAuthCredential
+  const providers: Partial<Record<SocialProvider, ProviderOptions>> & {
+    facebook?: ProviderOptions & {
+      mapProfileToUser?: typeof mapFacebookProfileToUser
+    }
+  } = {}
+  const pinnedOrigin = new URL(redirectOrigin ?? getBrokerUrl()).origin
+  for (const provider of SOCIAL_PROVIDERS) {
+    const credential = socialCredentials?.[provider]
+    if (credential?.clientId && credential.clientSecret) {
+      const scope = socialScopes?.[provider]
+      providers[provider] = {
+        enabled: true,
+        clientId: credential.clientId,
+        clientSecret: credential.clientSecret,
+        // Pin the redirect_uri to a single registered host — the broker by
+        // default, or the reseller's own custom domain for a tenant-owned
+        // credential (`socialRedirectOrigin`). Without this, better-auth
+        // infers it from the request origin, which may not be registered
+        // with the provider. When pinned to the broker, the callback relays
+        // back to the reseller domain afterwards.
+        redirectURI: new URL(
+          `/api/auth/callback/${provider}`,
+          pinnedOrigin,
+        ).toString(),
+        // Replace (not append to) better-auth's own default scope list when the
+        // caller supplies one, so the caller-provided scopes are the single
+        // source of truth regardless of the provider's internal defaults.
+        ...(scope && { scope, disableDefaultScope: true }),
+      }
+    }
+  }
+  if (providers.facebook) {
+    // A phone-only Facebook account returns no email; without this
+    // better-auth aborts the callback with `email_not_found`.
+    providers.facebook = {
+      ...providers.facebook,
+      mapProfileToUser: mapFacebookProfileToUser,
+    }
+  }
+
+  const apple = buildAppleProvider()
+  const allProviders = { ...providers, ...(apple && { apple }) }
+  return Object.keys(allProviders).length > 0 ? allProviders : undefined
+}
+
+/**
+ * Build the `databaseHooks` block: `user.create.after` fires
+ * `config.onUserCreated`; `account.create.before` / `account.update.before`
+ * fire `config.upgradeOAuthAccount` right before an OAuth account row is
+ * persisted (e.g. Facebook short-lived → long-lived token exchange, run on
+ * every social sign-in — a returning user hits `update`, not `create`).
+ * `account.create.before` always runs `claimUnverifiedAccountBeforeLink` first
+ * (before the insert, and before better-auth marks the user verified), then the
+ * token upgrade; the claim hook fails closed. The user/token-upgrade hooks are
+ * best-effort: a throwing hook never blocks sign-up/sign-in, and on failure the
+ * original data is persisted unmodified.
+ */
+function buildDatabaseHooks({
+  onUserCreated,
+  upgradeOAuthAccount,
+}: Pick<AuthConfig, "onUserCreated" | "upgradeOAuthAccount">) {
+  const userHooks = {
+    create: {
+      before: async (
+        user: Record<string, unknown>,
+        context: SignUpGateContext | null,
+      ) => {
+        // The anonymous plugin mints throwaway webchat/mobile users. They are
+        // not account sign-ups and must remain available while locked down.
+        if (user.isAnonymous === true) {
+          return
+        }
+        if (!(await isSignUpAllowed(context))) {
+          // better-auth turns this exact message into the OAuth redirect's
+          // `error` parameter.
+          throw new APIError("FORBIDDEN", { message: SIGNUP_DISABLED_CODE })
+        }
+        // Defense in depth: never let a tenant's owner email be re-created as
+        // a sub-account row in that tenant through any better-auth path.
+        if (typeof user.email === "string") {
+          try {
+            await assertNotTenantOwnerEmail({
+              email: user.email,
+              tenantId: getTenantId(),
+            })
+          } catch (err) {
+            if (
+              err instanceof ChatbotXException &&
+              err.code === "tenantOwnerEmailReserved"
+            ) {
+              throw new APIError("CONFLICT", { message: err.code })
+            }
+            throw err
+          }
+        }
+      },
+      ...(onUserCreated && {
+        after: async (user: Record<string, unknown>) => {
+          try {
+            await onUserCreated({
+              id: String(user.id),
+              email: String(user.email),
+              tenantId:
+                typeof user.tenantId === "string" ? user.tenantId : undefined,
+              isAnonymous:
+                typeof user.isAnonymous === "boolean"
+                  ? user.isAnonymous
+                  : undefined,
+            })
+          } catch {
+            // Best-effort: provisioning must never block sign-up. The callback
+            // is responsible for logging its own failures.
+          }
+        },
+      }),
+    },
+  }
+
+  const upgradeAccountBeforeHook = upgradeOAuthAccount
+    ? async (account: Record<string, unknown>) => {
+        try {
+          const patch = await upgradeOAuthAccount({
+            providerId: String(account.providerId),
+            accessToken:
+              typeof account.accessToken === "string"
+                ? account.accessToken
+                : null,
+          })
+          if (!patch) {
+            return
+          }
+          return { data: { ...account, ...patch } }
+        } catch {
+          // Best-effort: a failed token upgrade must never block sign-in —
+          // the original (short-lived) token is persisted instead.
+        }
+      }
+    : undefined
+
+  return {
+    user: userHooks,
+    session: {
+      create: {
+        before: async (session: Record<string, unknown>) => {
+          const userId =
+            typeof session.userId === "string" ? session.userId : ""
+          const user = userId ? await userService.findById(userId) : undefined
+          if (user?.deletionRequestedAt) {
+            throw new APIError("FORBIDDEN", {
+              code: "ACCOUNT_DELETION_PENDING",
+              message: "Account deletion is pending",
+            })
+          }
+        },
+      },
+    },
+    account: {
+      create: {
+        before: async (
+          account: Parameters<typeof claimUnverifiedAccountBeforeLink>[0],
+          context: Parameters<typeof claimUnverifiedAccountBeforeLink>[1],
+        ) => {
+          await claimUnverifiedAccountBeforeLink(account, context)
+          return upgradeAccountBeforeHook
+            ? await upgradeAccountBeforeHook(account)
+            : undefined
+        },
+      },
+      ...(upgradeAccountBeforeHook && {
+        update: { before: upgradeAccountBeforeHook },
+      }),
+    },
+  }
+}
+
+/**
+ * Gates `/sign-up/email` and prevents native-only providers from reaching
+ * better-auth's web social endpoints.
+ */
+const guardAuthEntryPoints = createAuthMiddleware(async (ctx) => {
+  const body = ctx.body as { email?: unknown; provider?: unknown } | undefined
+  if (
+    (ctx.path === "/sign-in/social" || ctx.path === "/link-social") &&
+    typeof body?.provider === "string" &&
+    NATIVE_ONLY_PROVIDERS[body.provider]
+  ) {
+    throw new APIError("NOT_FOUND", {
+      code: "PROVIDER_NOT_ENABLED",
+      message: "Provider is not enabled",
+    })
+  }
+  if (ctx.path === "/callback/:id" && ctx.params?.id === "apple") {
+    throw new APIError("NOT_FOUND", {
+      code: "PROVIDER_NOT_ENABLED",
+      message: "Provider is not enabled",
+    })
+  }
+  if (ctx.path === "/sign-up/email" && isPlaceholderEmail(body?.email)) {
+    throw new APIError("BAD_REQUEST", { message: "Invalid email" })
+  }
+  if (ctx.path === "/sign-up/email" && !(await isSignUpAllowed(ctx))) {
+    throw new APIError("FORBIDDEN", { message: "Sign-up is disabled" })
+  }
+  return defaultMcpResource(ctx)
+})
+
+const firstString = (...values: unknown[]): string | undefined =>
+  values.find((value): value is string => typeof value === "string")
+
+const joinStrings = (...values: unknown[]): string =>
+  values.filter((value): value is string => typeof value === "string").join(" ")
+
+export function createAuth(config: AuthConfig) {
+  const socialProviders = buildSocialProviders(
+    config.socialCredentials,
+    config.socialScopes,
+    config.socialRedirectOrigin,
+  )
+  const genericOAuthProvider = resolveGenericOAuthConfig()
+  const mcpResource = getMcpResourceUrl()
+
+  return betterAuth({
+    databaseHooks: buildDatabaseHooks({
+      onUserCreated: config.onUserCreated,
+      upgradeOAuthAccount: config.upgradeOAuthAccount,
+    }),
+    database: createTenantScopedAdapter(
+      drizzleAdapter(db, {
+        provider: "pg",
+        schema: {
+          user: userModel,
+          verification: verificationModel,
+          session: sessionModel,
+          account: accountModel,
+          jwks: jwkModel,
+          oauthAccessToken: oauthAccessTokenModel,
+          oauthClient: oauthClientModel,
+          oauthClientAssertion: oauthClientAssertionModel,
+          oauthClientResource: oauthClientResourceModel,
+          oauthConsent: oauthConsentModel,
+          oauthRefreshToken: oauthRefreshTokenModel,
+          oauthResource: oauthResourceModel,
+        },
+      }),
+    ),
+    // `tenantId` is the white-label tenant key. Declared on both `user` and
+    // `account` so better-auth maps it to the column and keeps the value the
+    // adapter wrapper stamps on insert (an undeclared field is dropped by
+    // `transformInput`, leaving the column to fall back to its root-tenant
+    // default). Never accepted from client input and never returned — the wrapper
+    // sets it from the bound tenant. See tenant-context.ts.
+    user: {
+      additionalFields: {
+        tenantId: {
+          type: "string",
+          required: false,
+          input: false,
+          returned: false,
+        },
+        mustChangePassword: {
+          type: "boolean",
+          required: false,
+          input: false,
+          returned: true,
+        },
+      },
+    },
+    account: {
+      // The OAuth flow lands on the fixed broker host and is then relayed back to
+      // the originating branded host (see route.ts). Because the authorize-time
+      // `state` cookie is host-scoped, it isn't guaranteed to be present on the
+      // broker leg of that cross-host hand-off. CSRF integrity instead rests on
+      // the `state` value persisted in the `Verification` table (validated by
+      // better-auth's `parseGenericState`) plus the origin allowlist in
+      // `oauth-referer.ts`, so the cookie check is safe to skip here.
+      skipStateCookieCheck: true,
+      accountLinking: {
+        enabled: true,
+        // Trust our own social providers' email claims. Google's id token
+        // always carries an accurate `email_verified`, but Facebook's Graph
+        // API never returns one at all — better-auth's link-account guard
+        // then falls back to treating the email as unverified and refuses to
+        // link, so ANY existing account (password, magic link, or the other
+        // social provider) sharing that email hits "account not linked" on
+        // every Facebook sign-in. Both providers gate signup on owning the
+        // mailbox, so trusting them here is safe. See `requireLocalEmailVerified`
+        // below for how an unverified local placeholder is handled.
+        trustedProviders: [
+          ...SOCIAL_PROVIDERS,
+          // Apple identity tokens always carry `email_verified` (also for
+          // private relay addresses); the claim is attested in
+          // `claim-unverified-account.ts`.
+          "apple",
+          ...(env.AUTH_OAUTH_TRUST_EMAIL ? [GENERIC_OAUTH_PROVIDER_ID] : []),
+        ],
+        // The local side may be an email/password sign-up that never clicked
+        // its verification link, or a Facebook-first user (Facebook never
+        // returns `email_verified`). A trusted provider has proven the mailbox,
+        // so the local flag must not block the link. The placeholder's own
+        // other login methods and sessions are removed by
+        // `claimUnverifiedAccountBeforeLink` (an `account.create.before` hook,
+        // so it runs before the link is written), and only a provider that
+        // attests the email may claim one — Google through the id_token's
+        // `email_verified`, Facebook because the Graph API returns only confirmed
+        // emails. That is what keeps this from being a pre-registration
+        // takeover. Emails must still match: the implicit sign-in path looks the
+        // user up by the provider email, and the explicit link route keeps
+        // `allowDifferentEmails` off.
+        requireLocalEmailVerified: false,
+      },
+      additionalFields: {
+        tenantId: {
+          type: "string",
+          required: false,
+          input: false,
+          returned: false,
+        },
+      },
+    },
+    socialProviders,
+    hooks: {
+      before: guardAuthEntryPoints,
+    },
+    emailAndPassword: {
+      enabled: true,
+      requireEmailVerification: true,
+      onPasswordReset: async ({ user }) => {
+        await mobileRefreshTokenService.revokeAllForUser({ userId: user.id })
+      },
+      sendResetPassword: async ({ user, url }, request) => {
+        if (isPlaceholderEmail(user.email)) {
+          return
+        }
+        if (!request) {
+          throw new APIError(400, {
+            message: "Unknown request",
+          })
+        }
+
+        const [originUrl, platformInfo, smtpResolution] = await Promise.all([
+          getPublicOriginFromRequest(request as unknown as Request),
+          getTenantSettings(request),
+          resolveSmtpForTenant(),
+        ])
+
+        if (smtpResolution.kind === "blocked") {
+          return
+        }
+
+        const resetPasswordUrl = new URL(url)
+        resetPasswordUrl.hostname = new URL(originUrl).hostname
+
+        const {
+          name: brandName,
+          logoLightUrl,
+          forgotPasswordEmailTemplate,
+        } = platformInfo
+
+        const props = {
+          brandName,
+          brandLogoUrl: logoLightUrl,
+          brandUrl: new URL("/", originUrl).toString(),
+          subject: DEFAULT_FORGOT_PASSWORD_SUBJECT,
+          userName: user.name ?? user.email,
+          resetPasswordUrl: resetPasswordUrl.toString(),
+          customTemplate: forgotPasswordEmailTemplate,
+        }
+        if (smtpResolution.kind === "transport") {
+          await sendResetPassword(user.email, props, smtpResolution.transport)
+        } else {
+          await sendResetPassword(user.email, props)
+        }
+      },
+    },
+    emailVerification: {
+      sendVerificationEmail: async ({ user, url }, request) => {
+        if (isPlaceholderEmail(user.email)) {
+          return
+        }
+        if (!request) {
+          throw new APIError(400, {
+            message: "Unknown request",
+          })
+        }
+
+        const [originUrl, platformInfo, smtpResolution] = await Promise.all([
+          getPublicOriginFromRequest(request as unknown as Request),
+          getTenantSettings(request),
+          resolveSmtpForTenant(),
+        ])
+
+        if (smtpResolution.kind === "blocked") {
+          return
+        }
+
+        const verificationUrl = new URL(url)
+        verificationUrl.hostname = new URL(originUrl).hostname
+
+        const {
+          name: brandName,
+          logoLightUrl,
+          signupEmailTemplate,
+        } = platformInfo
+
+        const props = {
+          brandName,
+          brandLogoUrl: logoLightUrl,
+          brandUrl: new URL("/", originUrl).toString(),
+          subject: DEFAULT_SIGNUP_SUBJECT,
+          userName: user.name ?? user.email,
+          verificationUrl: verificationUrl.toString(),
+          customTemplate: signupEmailTemplate,
+        }
+        if (smtpResolution.kind === "transport") {
+          await sendSignUpVerification(
+            user.email,
+            props,
+            smtpResolution.transport,
+          )
+        } else {
+          await sendSignUpVerification(user.email, props)
+        }
+      },
+    },
+    plugins: [
+      magicLink({
+        sendMagicLink: async ({ email, url }, request) => {
+          if (isPlaceholderEmail(email)) {
+            return
+          }
+          if (!request) {
+            throw new APIError(400, {
+              message: "Unknown request",
+            })
+          }
+
+          const [originUrl, platformInfo, smtpResolution] = await Promise.all([
+            getPublicOriginFromRequest(request as unknown as Request),
+            getTenantSettings(request as unknown as Request),
+            resolveSmtpForTenant(),
+          ])
+
+          if (smtpResolution.kind === "blocked") {
+            return
+          }
+
+          const magicUrl = new URL(url)
+          magicUrl.hostname = new URL(originUrl).hostname
+
+          const {
+            name: brandName,
+            logoLightUrl,
+            magicLinkEmailTemplate,
+          } = platformInfo
+
+          const tenantId = getTenantId()
+          // Match the tenant's users by email, plus the reseller-owner on their
+          // own custom domain (the owner's account lives in the root tenant, so
+          // the owner arm is constrained to it). Mirrors the findOne
+          // reseller-owner fallback above (`ownerRootClauses`).
+          //
+          // NOTE: this only gates whether a link is *sent*. The token better-auth
+          // stores in `Verification` carries no tenant, so a token issued in one
+          // tenant and replayed (with the host rewritten) against another tenant's
+          // domain would verify under that other tenant. Closing this fully needs a
+          // tenant-scoped verification lookup, which better-auth doesn't expose as a
+          // hook today. Practical exploit requires intercepting the victim's email.
+          // See docs/tenancy.md → "Residual security considerations".
+          const ownerId = await resolveTenantOwnerId(tenantId)
+          const user = await db.query.userModel.findFirst({
+            where: {
+              email,
+              OR: [
+                { tenantId },
+                ...(ownerId ? [{ id: ownerId, tenantId: ROOT_TENANT_ID }] : []),
+              ],
+            },
+            // Only the display name is used, so never read the whole row.
+            columns: { name: true },
+          })
+          if (!user) {
+            throw new APIError(400, {
+              message: `Your email is not registered with ${brandName}`,
+            })
+          }
+
+          const props = {
+            brandName,
+            brandLogoUrl: logoLightUrl,
+            brandUrl: new URL("/", originUrl).toString(),
+            subject: DEFAULT_MAGIC_LINK_SUBJECT,
+            userName: user.name ?? email,
+            magicUrl: magicUrl.toString(),
+            customTemplate: magicLinkEmailTemplate,
+          }
+          if (smtpResolution.kind === "transport") {
+            await sendMagicLink(email, props, smtpResolution.transport)
+          } else {
+            await sendMagicLink(email, props)
+          }
+        },
+      }),
+      oneTimeToken(),
+      // Enables mobile (bearer-only) clients: a before-hook rewrites
+      // `Authorization: Bearer <token>` into the session cookie header, and an
+      // after-hook mirrors session Set-Cookie into a `set-auth-token` response
+      // header. Since it rewrites `context.headers`, `auth.api.getSession`
+      // (and everything built on it — oRPC, authMiddleware) works unchanged.
+      bearer(),
+      anonymous({
+        emailDomainName: "anonymous.example.com",
+        generateName: () => `Anonymous ${createId()}`,
+      }),
+      ...(genericOAuthProvider
+        ? ([
+            genericOAuth({
+              config: [
+                {
+                  ...genericOAuthProvider,
+                  pkce: true,
+                  // The web client signs out locally and never follows an
+                  // `end_session_endpoint` redirect, so keep 1.6 behavior.
+                  disableProviderLogout: true,
+                  // 1.7 binds an ID token to a nonce; an IdP that never echoes
+                  // one needs this escape hatch (AUTH_OAUTH_DISABLE_NONCE_BINDING).
+                  disableIdTokenNonceBinding:
+                    env.AUTH_OAUTH_DISABLE_NONCE_BINDING,
+                  // Pin the redirect URI to the broker, then relay the callback
+                  // to the originating branded host as social OAuth already does.
+                  // Better Auth 1.7 moved this from /oauth2/callback/<id>; IdPs
+                  // registered before the upgrade must update their redirect URI.
+                  redirectURI: new URL(
+                    `/api/auth/callback/${GENERIC_OAUTH_PROVIDER_ID}`,
+                    new URL(getBrokerUrl()).origin,
+                  ).toString(),
+                  accountSubject: ({ profile }) => {
+                    const subject = profile.id ?? profile.sub
+                    return subject === undefined || subject === null
+                      ? ""
+                      : String(subject)
+                  },
+                  mapProfileToUser: (profile) => ({
+                    name:
+                      firstString(profile.name, profile.preferred_username) ??
+                      (joinStrings(profile.given_name, profile.family_name) ||
+                        undefined),
+                  }),
+                },
+              ],
+            }),
+          ] as const)
+        : ([] as const)),
+      jwt({
+        disableSettingJwtHeader: true,
+        jwt: { issuer: getBuilderOrigin() },
+      }),
+      // The mcp/oauth-provider plugin seeds its `OAuthResource` row from `init`,
+      // i.e. a DB query whenever `createAuth` runs. During `next build` that fires
+      // in every page-data worker for nothing (and fails with no DB). Skip it
+      // there; the runtime server re-evaluates `createAuth` and seeds normally.
+      ...(process.env.NEXT_PHASE === "phase-production-build"
+        ? ([] as const)
+        : ([mcp(buildMcpPluginOptions(mcpResource))] as const)),
+      // Native mobile app JWT grants (`/mobile/*`). Own endpoints and a
+      // password-change hook only; no hook on sign-in/session, and the global
+      // jwt()/JWKS/MCP configuration above is untouched.
+      mobileAuth(),
+      // Relays better-auth's Set-Cookie into the Next.js response. Required so a
+      // server-side `auth.api.changePassword` (with `revokeOtherSessions`) rotates
+      // the caller's session cookie instead of silently logging them out. Must be
+      // the LAST plugin so it runs after every other plugin's cookie writes.
+      nextCookies(),
+    ],
+    session: {
+      cookieCache: {
+        enabled: true,
+        maxAge: 5 * 60,
+        strategy: "compact",
+      },
+    },
+    advanced: {
+      database: AUTH_DATABASE_OPTIONS,
+    },
+    trustedOrigins: async () => {
+      // better-auth resolves the function form of `trustedOrigins` once at
+      // instance creation (createContext), not just per request, so this
+      // thunk also runs while `next build` collects page data — with no
+      // Redis/Postgres reachable. Skip the CustomDomain lookup then; no
+      // requests are served during the build. Mirrors buildSocialProviders above.
+      const staticOrigins = [
+        getBrokerUrl(),
+        env.NEXT_PUBLIC_BUILDER_URL,
+        // Mobile app deep-link schemes (chatbotx-mobile-app) — social sign-in relays back into the
+        // app via these custom schemes instead of an https:// origin. Keep in sync with
+        // DEFAULT_MOBILE_APP_SCHEMES in ./keys.
+        "chatconnectxapp://",
+        "chatbotxmobileapp://",
+      ]
+      if (process.env.NEXT_PHASE === PHASE_PRODUCTION_BUILD) {
+        return Array.from(new Set(staticOrigins))
+      }
+
+      // Broker + builder + every active custom domain. The broker is where
+      // callbacks land; the builder and custom domains are valid relay targets
+      // (where sign-in is initiated and the session cookie is written).
+      const domains = await customDomainService.listActiveDomains()
+      return Array.from(
+        new Set([
+          ...staticOrigins,
+          ...domains.map((domain) => `https://${domain}`),
+        ]),
+      )
+    },
+  })
+}
+
+export type Auth = ReturnType<typeof createAuth>
+
+export {
+  isGenericOAuthPath,
+  isSharedSocialPath,
+  resolveGenericOAuthConfig,
+  warnIfGenericOAuthUnlicensed,
+} from "./generic-oauth"
+export { isSignUpDisabled } from "./keys"
+export { GENERIC_OAUTH_PROVIDER_ID } from "./oauth-constants"
+export {
+  INVITATION_COOKIE_MAX_AGE_SECONDS,
+  INVITATION_COOKIE_NAME,
+} from "./signup-gate"

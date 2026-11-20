@@ -1,0 +1,30 @@
+{
+  "name": "@chatbotx.io/integration-mailchimp",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@chatbotx.io/logger": "workspace:*",
+    "@chatbotx.io/sdk": "workspace:*",
+    "@noble/hashes": "^2.2.0",
+    "ky": "catalog:",
+    "universal-error-normalizer": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@chatbotx.io/typescript-config": "workspace:*",
+    "@chatbotx.io/vitest-config": "workspace:*",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./**/*": "./src/**/*.ts"
+  },
+  "scripts": {
+    "check-types": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
+  }
+}

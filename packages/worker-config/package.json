@@ -1,0 +1,35 @@
+{
+  "name": "@chatbotx.io/worker-config",
+  "version": "0.1.0",
+  "type": "module",
+  "devDependencies": {
+    "@chatbotx.io/typescript-config": "workspace:*",
+    "@chatbotx.io/vitest-config": "workspace:*",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "dependencies": {
+    "@chatbotx.io/analytics": "workspace:*",
+    "@chatbotx.io/database": "workspace:*",
+    "@chatbotx.io/flow-config": "workspace:*",
+    "@chatbotx.io/logger": "workspace:*",
+    "@chatbotx.io/redis": "workspace:*",
+    "@chatbotx.io/sdk": "workspace:*",
+    "@chatbotx.io/utils": "workspace:*",
+    "@t3-oss/env-nextjs": "catalog:",
+    "@types/node": "catalog:",
+    "bullmq": "^5.76.4",
+    "ioredis": "catalog:",
+    "zod": "catalog:"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./contact-pii": "./src/lib/contact-pii.ts",
+    "./keys": "./src/keys.ts"
+  },
+  "scripts": {
+    "check-types": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
+  }
+}

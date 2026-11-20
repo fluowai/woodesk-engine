@@ -1,0 +1,393 @@
+import { adsConversionEventRelations } from "./ads-conversion-event"
+import { adsConversionRuleRelations } from "./ads-conversion-rule"
+import { aiAgentRelations } from "./ai-agent"
+import { aiConversationSourceRelations } from "./ai-conversation-source"
+import { aiEmbeddingRelations } from "./ai-embedding"
+import { aiFileRelations } from "./ai-file"
+import { aiFunctionRelations } from "./ai-function"
+import { aiHandoverBulkRunRelations } from "./ai-handover-bulk-run"
+import { aiHandoverSettingsRelations } from "./ai-handover-settings"
+import { aiMCPServerRelations } from "./ai-mcp-server"
+import {
+  analyticsAgentResponseEventRelations,
+  analyticsBotMessageEventRelations,
+  analyticsContactEventRelations,
+  analyticsConversationEventRelations,
+} from "./analytics"
+import { analyticsEmailTopicRelations } from "./analytics-email-topic"
+import { appointmentRelations } from "./appointment"
+import { appointmentCalendarRelations } from "./appointment-calendar"
+import { appointmentReminderDispatchRelations } from "./appointment-reminder-dispatch"
+import { attachmentRelations } from "./attachment"
+import { accountRelations } from "./auth-account"
+import { invitationRelations } from "./auth-invitation"
+import { sessionRelations } from "./auth-session"
+import { automatedResponseRelations } from "./automated-response"
+import { automationThrottleRelations } from "./automation-throttle"
+import { botFieldRelations } from "./bot-field"
+import { broadcastRelations } from "./broadcast"
+import { broadcastRecurrenceRelations } from "./broadcast-recurrence"
+import { broadcastTargetRelations } from "./broadcast-target"
+import { channelPostRelations } from "./channel-post"
+import { coexistSyncRunRelations } from "./coexist-sync-run"
+import { commentAutomationRelations } from "./comment-automation"
+import { commentAutomationEventRelations } from "./comment-automation-event"
+import { commentAutomationMissRelations } from "./comment-automation-miss"
+import { commentAutomationReplyRelations } from "./comment-automation-reply"
+import { commentModerationLogRelations } from "./comment-moderation-log"
+import { connectSessionRelations } from "./connect-session"
+import { connectionRelations } from "./connection"
+import { contactRelations } from "./contact"
+import { contactCustomFieldRelations } from "./contact-custom-field"
+import { contactInboxRelations } from "./contact-inbox"
+import { contactInboxPostRelations } from "./contact-inbox-post"
+import { contactNoteRelations } from "./contact-note"
+import { contactsOnBroadcastsRelations } from "./contact-on-broadcast"
+import { contactsOnSequenceRelations } from "./contact-on-sequence"
+import { contactOnSmartDelayRelations } from "./contact-on-smart-delay"
+import { contactReferralEventRelations } from "./contact-referral-event"
+import { contactSyncRelations } from "./contact-sync"
+import { contactsToTagsRelations } from "./contact-to-tag"
+import { contactToTagChannelRelations } from "./contact-to-tag-channel"
+import { conversationRelations } from "./conversation"
+import { conversationParticipantRelations } from "./conversation-participant"
+import { couponRelations } from "./coupon"
+import { platformCredentialRelations } from "./credential"
+import { customFieldRelations } from "./custom-field"
+import { decisionRelations } from "./decision"
+import { dynamicImageRelations } from "./dynamic-image"
+import { ecommerceRelations } from "./ecommerce"
+import { emailTopicRelations } from "./email-topic"
+import { auditLogRelations } from "./enterprise/audit-log"
+import { customDomainRelations } from "./enterprise/custom-domain"
+import { licenseRelations } from "./enterprise/license"
+import { platformAdminRelations } from "./enterprise/platform-admin"
+import { tenantRelations } from "./enterprise/tenant"
+import { tenantDefaultTemplateRelations } from "./enterprise/tenant-default-template"
+import { tenantDefaultTemplateEventRelations } from "./enterprise/tenant-default-template-event"
+import { tenantHelpItemRelations } from "./enterprise/tenant-help-item"
+import { userQuotaRelations } from "./enterprise/user-quota"
+import { workspaceUsageRelations } from "./enterprise/workspace-usage"
+import { errorLogRelations } from "./error-log"
+import { externalWebhookRelations } from "./external-webhook"
+import { facebookLeadAdsAutomationRelations } from "./facebook-lead-ads-automation"
+import { facebookLeadAdsLeadRelations } from "./facebook-lead-ads-lead"
+import { facebookMarketingMessageRelations } from "./facebook-marketing-message"
+import { facebookMarketingMessageAudienceRelations } from "./facebook-marketing-message-audience"
+import { facebookMarketingMessageRecipientRelations } from "./facebook-marketing-message-recipient"
+import { facebookMarketingMessagesAuthRelations } from "./facebook-marketing-messages-auth"
+import { fileRelations } from "./file"
+import { flowRelations } from "./flow"
+import { flowAnalyticsSessionRelations } from "./flow-analytics-session"
+import { flowNodeStatRelations } from "./flow-node-stat"
+import { flowRunRelations } from "./flow-run"
+import { flowVersionRelations } from "./flow-version"
+import { folderRelations } from "./folder"
+import { googleAdsConversionEventRelations } from "./google-ads-conversion-event"
+import { googleAdsSettingsRelations } from "./google-ads-settings"
+import { igStoryAutomationRelations } from "./ig-story-automation"
+import { importRelations } from "./import"
+import { inboundWebhookRelations } from "./inbound-webhook"
+import { inboxRelations } from "./inbox"
+import { inboxContactStatsRelations } from "./inbox-contact-stats"
+import { inboxTeamRelations } from "./inbox-team"
+import { inboxTeamMemberRelations } from "./inbox-team-member"
+import { integrationRelations } from "./integration"
+import { integrationActiveCampaignRelations } from "./integration-active-campaign"
+import { integrationApiRelations } from "./integration-api"
+import { integrationClaudeRelations } from "./integration-claude"
+import { integrationDeepseekRelations } from "./integration-deepseek"
+import { integrationDripRelations } from "./integration-drip"
+import { integrationFacebookAdsRelations } from "./integration-facebook-ads"
+import { integrationGeminiRelations } from "./integration-gemini"
+import { integrationGetResponseRelations } from "./integration-get-response"
+import { integrationGoogleAdsRelations } from "./integration-google-ads"
+import { integrationGoogleCalendarRelations } from "./integration-google-calendar"
+import { integrationGoogleSheetsRelations } from "./integration-google-sheets"
+import { integrationInstagramRelations } from "./integration-instagram"
+import { integrationKlaviyoRelations } from "./integration-klaviyo"
+import { integrationLineRelations } from "./integration-line"
+import { integrationMailchimpRelations } from "./integration-mailchimp"
+import { integrationMailerLiteRelations } from "./integration-mailer-lite"
+import { integrationMessengerRelations } from "./integration-messenger"
+import { integrationMoosendRelations } from "./integration-moosend"
+import { integrationMuseRelations } from "./integration-muse"
+import { integrationOpenaiRelations } from "./integration-openai"
+import { integrationOpenaiCompatibleRelations } from "./integration-openai-compatible"
+import { integrationOpenrouterRelations } from "./integration-openrouter"
+import { integrationOutlookCalendarRelations } from "./integration-outlook-calendar"
+import { integrationSendGridRelations } from "./integration-sendgrid"
+import { integrationSmtpRelations } from "./integration-smtp"
+import { integrationTelegramRelations } from "./integration-telegram"
+import { integrationThreadsRelations } from "./integration-threads"
+import { integrationTiktokRelations } from "./integration-tiktok"
+import { integrationWebchatRelations } from "./integration-webchat"
+import { integrationWhatsappRelations } from "./integration-whatsapp"
+import { integrationZaloRelations } from "./integration-zalo"
+import { leaderboardRelations } from "./leaderboard"
+import { leaderboardAuditLogRelations } from "./leaderboard-audit-log"
+import { leaderboardParticipantRelations } from "./leaderboard-participant"
+import { magicLinkRelations } from "./magic-link"
+import { mediaLibraryFileRelations } from "./media-library-file"
+import { mediaLibraryFolderRelations } from "./media-library-folder"
+import { messageRelations } from "./message"
+import { messagingAdOperationRelations } from "./messaging-ad-operation"
+import { messagingAdsConnectionRelations } from "./messaging-ads-connection"
+import { messengerMessageTemplateRelations } from "./messenger-message-template"
+import { messengerWelcomeMessageFlowRelations } from "./messenger-welcome-message-flow"
+import { metaCapiEventRelations } from "./meta-capi-event"
+import { metaCatalogRelations } from "./meta-catalog"
+import { miniAppRelations } from "./mini-app"
+import { minigameRelations } from "./minigame"
+import { minigameContactRelations } from "./minigame-contact"
+import { minigamePlayRelations } from "./minigame-play"
+import { mobileRefreshTokenRelations } from "./mobile-refresh-token"
+import { oauthAccessTokenRelations } from "./oauth-access-token"
+import { oauthClientRelations } from "./oauth-client"
+import { oauthClientAssertionRelations } from "./oauth-client-assertion"
+import { oauthClientResourceRelations } from "./oauth-client-resource"
+import { oauthConsentRelations } from "./oauth-consent"
+import { oauthRefreshTokenRelations } from "./oauth-refresh-token"
+import { oauthResourceRelations } from "./oauth-resource"
+import { pipelineRelations } from "./pipeline"
+import { placeNearMeRelations } from "./place-near-me"
+import { pollRelations } from "./poll"
+import { productRelations } from "./product"
+import { productCategoryRelations } from "./product-category"
+import { questionnaireRelations } from "./questionnaire"
+import { reflinkRelations } from "./reflink"
+import { resourceDeletionLogRelations } from "./resource-deletion-log"
+import { savedReplyRelations } from "./save-reply"
+import { savedReplyImageRelations } from "./saved-reply-image"
+import { sequenceRelations } from "./sequence"
+import { sequenceDispatchRelations } from "./sequence-dispatch"
+import { sequenceStepRelations } from "./sequence-step"
+import { spreadsheetRelations } from "./spreadsheet"
+import { tagRelations } from "./tag"
+import { tagChannelRelations } from "./tag-channel"
+import { telegramChatRelations } from "./telegram-chat"
+import { templateRelations } from "./template"
+import { templateInstallationRelations } from "./template-installation"
+import { templateInstalledResourceRelations } from "./template-installed-resource"
+import { templateStoreRelations } from "./template-store"
+import { templateUninstallOperationRelations } from "./template-uninstall-operation"
+import { templateVersionRelations } from "./template-version"
+import { triggerRelations } from "./trigger"
+import { conditionRelations } from "./trigger-condition"
+import { triggerContactHistoryRelations } from "./trigger-contact-history"
+import { triggerExecutionRelations } from "./trigger-execution"
+import { triggerStatsRelations } from "./trigger-stats"
+import { userRelations } from "./user"
+import { userDeviceTokenRelations } from "./user-device-token"
+import { userPersistentMenuRelations } from "./user-persistent-menu"
+import { webhookRelations } from "./webhook"
+import { webhookExecutionRelations } from "./webhook-execution"
+import { whatsappBusinessAccountRelations } from "./whatsapp-business-account"
+import { whatsappCallRelations } from "./whatsapp-call"
+import { whatsappCallPermissionRelations } from "./whatsapp-call-permission"
+import { whatsappFlowRelations } from "./whatsapp-flow"
+import { whatsappMessageTemplateRelations } from "./whatsapp-message-template"
+import { whatsappSignupSessionRelations } from "./whatsapp-signup-session"
+import { workingHoursRelations } from "./working-hours"
+import { workspaceRelations } from "./workspace"
+import { workspaceApiTokenRelations } from "./workspace-api-token"
+import { workspaceBotMessageUsageRelations } from "./workspace-bot-message-usage"
+import { workspaceDeletionRecordRelations } from "./workspace-deletion-record"
+import { workspaceMemberRelations } from "./workspace-member"
+
+export const relations = {
+  ...integrationApiRelations,
+  ...contactSyncRelations,
+  ...connectionRelations,
+  ...connectSessionRelations,
+  ...adsConversionEventRelations,
+  ...metaCapiEventRelations,
+  ...messagingAdOperationRelations,
+  ...messagingAdsConnectionRelations,
+  ...adsConversionRuleRelations,
+  ...integrationOpenaiRelations,
+  ...channelPostRelations,
+  ...contactRelations,
+  ...contactInboxPostRelations,
+  ...contactReferralEventRelations,
+  ...tagRelations,
+  ...templateRelations,
+  ...templateInstallationRelations,
+  ...templateInstalledResourceRelations,
+  ...templateUninstallOperationRelations,
+  ...templateVersionRelations,
+  ...accountRelations,
+  ...userRelations,
+  ...workspaceRelations,
+  ...workspaceApiTokenRelations,
+  ...workspaceBotMessageUsageRelations,
+  ...workspaceDeletionRecordRelations,
+  ...aiAgentRelations,
+  ...aiConversationSourceRelations,
+  ...aiFileRelations,
+  ...flowRelations,
+  ...aiMCPServerRelations,
+  ...attachmentRelations,
+  ...conversationRelations,
+  ...couponRelations,
+  ...messageRelations,
+  ...messengerWelcomeMessageFlowRelations,
+  ...automatedResponseRelations,
+  ...customDomainRelations,
+  ...licenseRelations,
+  ...platformAdminRelations,
+  ...tenantRelations,
+  ...tenantDefaultTemplateRelations,
+  ...tenantDefaultTemplateEventRelations,
+  ...tenantHelpItemRelations,
+  ...platformCredentialRelations,
+  ...userQuotaRelations,
+  ...workspaceUsageRelations,
+  ...contactCustomFieldRelations,
+  ...customFieldRelations,
+  ...decisionRelations,
+  ...dynamicImageRelations,
+  ...broadcastRelations,
+  ...broadcastRecurrenceRelations,
+  ...broadcastTargetRelations,
+  ...inboxTeamRelations,
+  ...inboxRelations,
+  ...conversationParticipantRelations,
+  ...folderRelations,
+  ...igStoryAutomationRelations,
+  ...importRelations,
+  ...inboundWebhookRelations,
+  ...fileRelations,
+  ...flowRunRelations,
+  ...flowVersionRelations,
+  ...inboxTeamMemberRelations,
+  ...integrationRelations,
+  ...integrationMessengerRelations,
+  ...aiHandoverBulkRunRelations,
+  ...aiHandoverSettingsRelations,
+  ...messengerMessageTemplateRelations,
+  ...integrationWebchatRelations,
+  ...integrationZaloRelations,
+  ...integrationLineRelations,
+  ...invitationRelations,
+  ...emailTopicRelations,
+  ...analyticsEmailTopicRelations,
+  ...appointmentRelations,
+  ...appointmentCalendarRelations,
+  ...appointmentReminderDispatchRelations,
+  ...errorLogRelations,
+  ...facebookLeadAdsAutomationRelations,
+  ...facebookLeadAdsLeadRelations,
+  ...facebookMarketingMessageRelations,
+  ...facebookMarketingMessageAudienceRelations,
+  ...facebookMarketingMessageRecipientRelations,
+  ...facebookMarketingMessagesAuthRelations,
+  ...commentAutomationRelations,
+  ...commentAutomationEventRelations,
+  ...commentAutomationMissRelations,
+  ...commentAutomationReplyRelations,
+  ...commentModerationLogRelations,
+  ...auditLogRelations,
+  ...sessionRelations,
+  ...oauthAccessTokenRelations,
+  ...oauthClientRelations,
+  ...oauthClientAssertionRelations,
+  ...oauthClientResourceRelations,
+  ...oauthConsentRelations,
+  ...oauthRefreshTokenRelations,
+  ...oauthResourceRelations,
+  ...spreadsheetRelations,
+  ...whatsappCallRelations,
+  ...whatsappCallPermissionRelations,
+  ...whatsappFlowRelations,
+  ...whatsappBusinessAccountRelations,
+  ...integrationWhatsappRelations,
+  ...whatsappMessageTemplateRelations,
+  ...workspaceMemberRelations,
+  ...contactNoteRelations,
+  ...aiEmbeddingRelations,
+  ...integrationGoogleAdsRelations,
+  ...googleAdsConversionEventRelations,
+  ...googleAdsSettingsRelations,
+  ...integrationGoogleCalendarRelations,
+  ...integrationGoogleSheetsRelations,
+  ...integrationFacebookAdsRelations,
+  ...integrationSmtpRelations,
+  ...integrationClaudeRelations,
+  ...integrationDeepseekRelations,
+  ...integrationMuseRelations,
+  ...integrationGeminiRelations,
+  ...integrationOpenrouterRelations,
+  ...integrationOutlookCalendarRelations,
+  ...integrationOpenaiCompatibleRelations,
+  ...contactsOnBroadcastsRelations,
+  ...contactsToTagsRelations,
+  ...tagChannelRelations,
+  ...telegramChatRelations,
+  ...contactToTagChannelRelations,
+  ...reflinkRelations,
+  ...resourceDeletionLogRelations,
+  ...magicLinkRelations,
+  ...sequenceRelations,
+  ...sequenceStepRelations,
+  ...contactsOnSequenceRelations,
+  ...sequenceDispatchRelations,
+  ...inboxContactStatsRelations,
+  ...triggerRelations,
+  ...webhookRelations,
+  ...webhookExecutionRelations,
+  ...externalWebhookRelations,
+  ...conditionRelations,
+  ...triggerStatsRelations,
+  ...triggerContactHistoryRelations,
+  ...triggerExecutionRelations,
+  ...contactInboxRelations,
+  ...aiFunctionRelations,
+  ...botFieldRelations,
+  ...mediaLibraryFolderRelations,
+  ...mediaLibraryFileRelations,
+  ...savedReplyRelations,
+  ...savedReplyImageRelations,
+  ...integrationTelegramRelations,
+  ...integrationTiktokRelations,
+  ...integrationInstagramRelations,
+  ...integrationThreadsRelations,
+  ...integrationActiveCampaignRelations,
+  ...integrationKlaviyoRelations,
+  ...integrationMailchimpRelations,
+  ...integrationMailerLiteRelations,
+  ...integrationMoosendRelations,
+  ...integrationDripRelations,
+  ...integrationGetResponseRelations,
+  ...integrationSendGridRelations,
+  ...flowAnalyticsSessionRelations,
+  ...flowNodeStatRelations,
+  ...contactOnSmartDelayRelations,
+  ...analyticsContactEventRelations,
+  ...analyticsBotMessageEventRelations,
+  ...analyticsConversationEventRelations,
+  ...productRelations,
+  ...ecommerceRelations,
+  ...productCategoryRelations,
+  ...metaCatalogRelations,
+  ...questionnaireRelations,
+  ...coexistSyncRunRelations,
+  ...userPersistentMenuRelations,
+  ...userDeviceTokenRelations,
+  ...mobileRefreshTokenRelations,
+  ...whatsappSignupSessionRelations,
+  ...automationThrottleRelations,
+  ...miniAppRelations,
+  ...minigameRelations,
+  ...minigameContactRelations,
+  ...minigamePlayRelations,
+  ...pollRelations,
+  ...placeNearMeRelations,
+  ...templateStoreRelations,
+  ...leaderboardRelations,
+  ...leaderboardParticipantRelations,
+  ...leaderboardAuditLogRelations,
+  ...workingHoursRelations,
+  ...analyticsAgentResponseEventRelations,
+  ...pipelineRelations,
+}

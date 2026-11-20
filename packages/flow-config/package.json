@@ -1,0 +1,30 @@
+{
+  "name": "@chatbotx.io/flow-config",
+  "version": "0.1.0",
+  "type": "module",
+  "devDependencies": {
+    "@chatbotx.io/typescript-config": "workspace:*",
+    "@chatbotx.io/vitest-config": "workspace:*",
+    "@types/node": "catalog:",
+    "@types/react": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "dependencies": {
+    "@chatbotx.io/utils": "workspace:*",
+    "@xyflow/react": "^12.10.2",
+    "date-fns": "catalog:",
+    "libphonenumber-js": "catalog:",
+    "zod": "catalog:"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./field-reference": "./src/field-reference.ts",
+    "./button-limits": "./src/steps/button-limits.ts"
+  },
+  "scripts": {
+    "check-types": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
+  }
+}

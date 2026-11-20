@@ -1,0 +1,93 @@
+import { keys as database } from "@chatbotx.io/database/keys"
+import { keys as mail } from "@chatbotx.io/mail/keys"
+import { keys as realtime } from "@chatbotx.io/realtime-protocol/keys"
+import { createEnv } from "@t3-oss/env-nextjs"
+import { z } from "zod"
+import { clientEnv } from "./lib/client-env"
+
+const editionRule = z
+  .enum(["community", "enterprise", "cloud"])
+  .default("community")
+
+export const env = createEnv({
+  extends: [realtime(), database(), mail()],
+  server: {
+    BETTER_AUTH_SECRET: z
+      .string()
+      .min(32, "BETTER_AUTH_SECRET must be at least 32 characters"),
+    BETTER_AUTH_URL: z.url(),
+    LICENSE_KEY: z.string().optional(),
+    WHATSAPP_OVERRIDE_CALLBACK_URI: z.url().optional(),
+    // Contact sync from AhaChat (docs/contact-sync.md): optional https base URL,
+    // path included (empty = unset, see emptyStringAsUndefined).
+    AHACHAT_API_BASE_URL: z.url({ protocol: /^https$/ }).optional(),
+    // The two AhaChat secrets: the API key sent and
+    // the hash key it signs with (never sent), each base64 of >= 32 random bytes.
+    // Validated where they are used: a bad value leaves the sync off (empty =
+    // unset). The key id names the pair for rotation (default k1).
+    AHACHAT_API_KEY: z.string().optional(),
+    AHACHAT_HASH_KEY: z.string().optional(),
+    AHACHAT_KEY_ID: z.string().optional(),
+    // WhatsApp VoIP calling (docs/whatsapp-calling.md) ICE/TURN relay.
+    TURN_URL: z.string().optional(),
+    TURN_STATIC_SECRET: z.string().optional(),
+    REALTIME_PROXY_URL: z.url().optional().default("http://localhost:1999"),
+    MCP_PROXY_URL: z.url().optional().default("http://localhost:3333"),
+    MCP_PUBLIC_URL: z.url().optional(),
+  },
+  client: {
+    NEXT_PUBLIC_BUILDER_URL: z.url(),
+    // Dedicated, brand-neutral broker host — the canonical provider-facing origin
+    // for both OAuth redirect_uris and host-validated webhooks (WhatsApp/Meta,
+    // TikTok). The single redirect_uri registered with every provider; callbacks
+    // relay back to the originating domain. Optional — falls back to
+    // NEXT_PUBLIC_BUILDER_URL via getBrokerUrl().
+    NEXT_PUBLIC_BROKER_URL: z.url().optional(),
+    NEXT_PUBLIC_EDITION: editionRule,
+    NEXT_PUBLIC_INTERNAL_STORAGE_URL: z
+      .url()
+      .optional()
+      .default("http://localhost:9000/chatbotx/"),
+    NEXT_PUBLIC_STORAGE_URL: z.url().optional(),
+    NEXT_PUBLIC_PANCAKE_CHAT_PAGE_ID: z.string().optional(),
+    NEXT_PUBLIC_AUTH_OAUTH_DISPLAY_NAME: z.string().optional(),
+    NEXT_PUBLIC_AUTH_OAUTH_LOGO_URL: z.url().optional(),
+    NEXT_PUBLIC_ALLOWED_DEV_ORIGINS: z
+      .string()
+      .optional()
+      .transform((val) =>
+        val
+          ?.split(",")
+          .map((v) => v.trim())
+          .filter(Boolean),
+      ),
+  },
+  experimental__runtimeEnv: {
+    NEXT_PUBLIC_BUILDER_URL:
+      clientEnv("NEXT_PUBLIC_BUILDER_URL") || "http://localhost:3123",
+    NEXT_PUBLIC_BROKER_URL: clientEnv("NEXT_PUBLIC_BROKER_URL"),
+    NEXT_PUBLIC_INTERNAL_STORAGE_URL:
+      clientEnv("NEXT_PUBLIC_INTERNAL_STORAGE_URL") ||
+      "http://localhost:9000/chatbotx/",
+    NEXT_PUBLIC_EDITION: clientEnv("NEXT_PUBLIC_EDITION") || "community",
+    NEXT_PUBLIC_STORAGE_URL: clientEnv("NEXT_PUBLIC_STORAGE_URL"),
+    NEXT_PUBLIC_PANCAKE_CHAT_PAGE_ID: clientEnv(
+      "NEXT_PUBLIC_PANCAKE_CHAT_PAGE_ID",
+    ),
+    NEXT_PUBLIC_AUTH_OAUTH_DISPLAY_NAME: clientEnv(
+      "NEXT_PUBLIC_AUTH_OAUTH_DISPLAY_NAME",
+    ),
+    NEXT_PUBLIC_AUTH_OAUTH_LOGO_URL: clientEnv(
+      "NEXT_PUBLIC_AUTH_OAUTH_LOGO_URL",
+    ),
+    NEXT_PUBLIC_ALLOWED_DEV_ORIGINS: clientEnv(
+      "NEXT_PUBLIC_ALLOWED_DEV_ORIGINS",
+    ),
+  },
+  emptyStringAsUndefined: true,
+  skipValidation: process.env.SKIP_ENV_CHECK === "true",
+})
+
+export const isEnterprise = () => env.NEXT_PUBLIC_EDITION === "enterprise"
+export const isCloud = () => env.NEXT_PUBLIC_EDITION === "cloud"
+export const isCommunity = () => env.NEXT_PUBLIC_EDITION === "community"

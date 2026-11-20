@@ -1,0 +1,1606 @@
+import {
+  contactActivityService,
+  contactInboxService,
+  contactService,
+  conversationService,
+  messageService,
+  queueWorkspaceRealtimeEvent,
+  threadControlService,
+  whatsappFlowService,
+} from "@chatbotx.io/business"
+import {
+  channelTypes,
+  isLegacyMemberMessage,
+  isSentFromInbox,
+  isServiceSendBlocked,
+  readThreadControlColumns,
+  resolveChannelConversationId,
+  resolveThreadControlState,
+  toThreadControlTimestamp,
+} from "@chatbotx.io/database/partials"
+import type {
+  ContactInboxModel,
+  ConversationModel,
+  MessageModel,
+} from "@chatbotx.io/database/types"
+import { emit } from "@chatbotx.io/event-bus"
+import {
+  isBulkOutboundMetadata,
+  type MetadataPayload,
+  messageEventTypeSchema,
+  stepTypes,
+} from "@chatbotx.io/flow-config"
+import {
+  type RealtimeEventData,
+  RealtimeEventType,
+  routeForConversation,
+} from "@chatbotx.io/realtime-protocol"
+import {
+  ChannelError,
+  ChannelErrorCategory,
+  type CommentAnchor,
+  type MessageButtonTemplate,
+  type OutgoingSendResult,
+  parseSdkError,
+  type ResolvedProductMessage,
+  type SendFlowStepData,
+} from "@chatbotx.io/sdk"
+import { resolveStackFrames } from "@chatbotx.io/utils/error-log"
+import { isManualSend, type SendFrom } from "@chatbotx.io/utils/send-from"
+import type {
+  ChatJobChangeChannelMessageState,
+  ChatJobDeleteChannelMessage,
+  ChatJobEditChannelMessage,
+  ChatJobSendChannelMessage,
+  ChatJobSendFlowStep,
+  ChatJobSendTyping,
+} from "@chatbotx.io/worker-config"
+import {
+  settleCommentAutomationDelivered,
+  settleCommentAutomationFailure,
+} from "../../lib/comment-automation-anchor"
+import {
+  failCommentModeration,
+  settleCommentModeration,
+} from "../../lib/comment-moderation"
+import { logger } from "../../lib/logger"
+import {
+  allIntegrations,
+  resolveIntegrationContextFromContactInbox,
+} from "../../services/integrations"
+import {
+  shouldSuppressRetryableChannelError,
+  willSendRetry,
+} from "../utils/retry"
+import { reconcileChannelSendError } from "./channel-send-error-reconcilers"
+
+// Keep private comment replies aligned with sendMessageToChannel's isPrivateReply
+// routing below and packages/business/src/message/create-outgoing.ts's DM routing.
+const isDirectMessage = (
+  message: Pick<MessageModel, "type" | "contentAttributes">,
+): boolean =>
+  message.type !== "comment" ||
+  message.contentAttributes?.isPrivateReply === true
+
+// Broadcasts and templates are deliberately NOT excluded: the inbox option
+// means "the bot's own direct messages count as read", and every bot send —
+// flow reply, broadcast, template — is one. Excluding any of them would leave
+// those conversations bold with the option on, which is exactly what it exists
+// to prevent. Public comment replies are excluded because they are not DMs.
+export const isDeliveredDirectMessage = ({
+  message,
+  result,
+}: {
+  message: Pick<MessageModel, "type" | "contentAttributes">
+  result: OutgoingSendResult
+}): boolean => result.sentCount > 0 && isDirectMessage(message)
+
+export const markConversationReadAfterDelivery = async (props: {
+  workspaceId: string
+  conversationId: string
+  inboxId: string
+  readAt: Date
+  silent?: boolean
+}): Promise<void> => {
+  try {
+    await conversationService.markReadByOutbound(props)
+  } catch (err) {
+    logger.warn(
+      { err, ...props },
+      "markReadByOutbound after a delivered send failed",
+    )
+  }
+}
+
+/**
+ * Error code of a Service send the local gate refused because another
+ * responder owns the thread. Distinct from any Meta code, so the rejection
+ * reconciler (which only reacts to Meta's) never records our own refusal.
+ */
+export const THREAD_NOT_OWNED_ERROR_CODE = "thread_not_owned"
+
+/**
+ * Shared by both send chokepoints. Only a known foreign owner blocks a Service
+ * send (templates, idle, owned and never-observed threads go to the channel,
+ * which is the authority). Throws a permanent `ChannelError` BEFORE the API
+ * call, which the existing failure path records as a send error without retry.
+ * Deliberately stricter than Meta: as escalation partner a Service send from
+ * this app would be an implicit take and silently steal the thread.
+ */
+const assertThreadOpenForServiceMessage = (
+  contactInbox: ContactInboxModel,
+  { isTemplateMessage }: { isTemplateMessage: boolean },
+): void => {
+  if (
+    !isServiceSendBlocked({
+      ...readThreadControlColumns(contactInbox),
+      isTemplateMessage,
+      now: new Date(),
+    })
+  ) {
+    return
+  }
+  throw new ChannelError(
+    "Message not sent: another app is handling this conversation",
+    ChannelErrorCategory.PERMISSION_DENIED,
+    { code: THREAD_NOT_OWNED_ERROR_CODE },
+  )
+}
+
+/**
+ * "Last Delivered" for a channel that reports no delivery receipts: the
+ * provider accepting the send is the delivery moment, as on webchat. A channel
+ * that declares receipts is recorded by the `message:delivered` listener
+ * instead, so this never double-counts it. The send already happened, so a
+ * bookkeeping failure is logged, never rethrown (a retry would send twice).
+ */
+export const recordDeliveredWhenNoReceipts = async (props: {
+  contactInbox: Pick<ContactInboxModel, "channel" | "contactId">
+  /** Messages the provider accepted; a send that dispatched none delivered nothing. */
+  sentCount: number
+  workspaceId: string
+}): Promise<void> => {
+  const integration = allIntegrations[props.contactInbox.channel]
+  if (!integration || integration.deliveryReceipts || props.sentCount <= 0) {
+    return
+  }
+  try {
+    await contactActivityService.recordDelivered({
+      records: [
+        { contactId: props.contactInbox.contactId, deliveredAt: new Date() },
+      ],
+      workspaceId: props.workspaceId,
+    })
+  } catch (err) {
+    logger.warn(
+      { err, workspaceId: props.workspaceId },
+      "last-delivered: failed to record a successful send",
+    )
+  }
+}
+
+/**
+ * A Service send that succeeded on a non-owned (idle/standby) thread made us
+ * the owner (Meta treats the escalation partner's send as an implicit take).
+ * A never-observed thread is left alone, and an owned one costs nothing. The
+ * send already happened, so a bookkeeping failure is logged, never rethrown
+ * (a retry would send twice).
+ */
+const recordServiceSent = async (props: {
+  conversation: Pick<ConversationModel, "id" | "workspaceId">
+  contactInbox: ContactInboxModel
+  isTemplateMessage: boolean
+  /**
+   * When the send was DISPATCHED (captured before the channel call), not when
+   * this bookkeeping runs: a handover that lands while the send is in flight is
+   * then newer than our implicit take and wins the guarded write, instead of
+   * being overwritten by a `serviceSent` stamped after the fact. Mirrors how
+   * `requestAction` stamps `occurredAt` before its channel call.
+   */
+  dispatchedAt: Date
+}): Promise<void> => {
+  const { conversation, contactInbox, isTemplateMessage, dispatchedAt } = props
+  const state = resolveThreadControlState({
+    ...readThreadControlColumns(contactInbox),
+    now: new Date(),
+  })
+  if (isTemplateMessage || state === null || state === "owned") {
+    return
+  }
+  try {
+    await threadControlService.recordEvent({
+      workspaceId: conversation.workspaceId,
+      inbox: { id: contactInbox.inboxId, threadControlSeenAt: null },
+      contactInbox,
+      conversationId: conversation.id,
+      event: "serviceSent",
+      occurredAt: toThreadControlTimestamp(dispatchedAt),
+    })
+  } catch (err) {
+    logger.warn(
+      { err, contactInboxId: contactInbox.id },
+      "Unable to record a service send for conversation routing",
+    )
+  }
+}
+
+/**
+ * The channel conversation id handed to the channel handler. SMTP only gets one
+ * for threads we opened (outreach), stored explicitly; a thread an inbound
+ * customer mail opened has none, so the reply threads under that mail instead
+ * of reusing the customer's Message-ID.
+ */
+function resolveSourceConversationId(
+  conversation: Pick<ConversationModel, "sourceId" | "additionalAttributes">,
+  channel: string,
+): string | null {
+  if (channel !== channelTypes.enum.smtp) {
+    return resolveChannelConversationId(conversation)
+  }
+  const stored = conversation.additionalAttributes?.channelConversationId
+  return typeof stored === "string" && stored ? stored : null
+}
+
+/**
+ * Gives SMTP one complete stored parent. The caller may override only its
+ * subject; raw headers never come from the outgoing request.
+ */
+async function withEmailThread<
+  T extends { contentAttributes?: unknown },
+>(props: {
+  message: T
+  conversation: Pick<
+    ConversationModel,
+    "id" | "workspaceId" | "lastActivityAt" | "createdAt"
+  >
+  contactInboxId: string
+}): Promise<T> {
+  const attributes = (props.message.contentAttributes ?? {}) as Record<
+    string,
+    unknown
+  >
+  const replyToMessageId =
+    typeof attributes.emailReplyToMessageId === "string"
+      ? attributes.emailReplyToMessageId
+      : undefined
+  const parent = await conversationService.findEmailReplyParent({
+    conversation: props.conversation,
+    contactInboxId: props.contactInboxId,
+    replyToMessageId,
+  })
+  if (!parent) {
+    return props.message
+  }
+  const explicitEmail =
+    typeof attributes.email === "object" && attributes.email !== null
+      ? (attributes.email as Record<string, unknown>)
+      : undefined
+  const subject =
+    typeof explicitEmail?.subject === "string"
+      ? explicitEmail.subject
+      : undefined
+  return {
+    ...props.message,
+    contentAttributes: {
+      ...attributes,
+      email: subject ? { ...parent, subject } : parent,
+    },
+  }
+}
+
+export async function sendMessageToChannel(
+  data: ChatJobSendChannelMessage["data"],
+  attemptsMade = 0,
+  // Whether a rethrow from here produces another `message:failed` for this same
+  // send — a BullMQ attempt still in hand, or a caller that catches and
+  // re-emits. Defaults to terminal, so an unaware caller records the failure
+  // rather than losing it.
+  willRetryOnThrow = false,
+): Promise<OutgoingSendResult> {
+  const {
+    conversation,
+    contactInbox,
+    message,
+    quickReplies,
+    metadata,
+    isBulkBroadcast,
+    sendFrom,
+  } = data
+  const isBulkOutbound =
+    isBulkOutboundMetadata(metadata, isBulkBroadcast) ||
+    isBulkOutboundMetadata(message.contentAttributes?.metadata, isBulkBroadcast)
+
+  // The job carries the contact inbox as it was at enqueue; a routing
+  // handover may have landed since. Routing decisions (the gate, the
+  // rejection reconciler, the implicit-take record) use the current row,
+  // re-read only when the thread has routing state (zero queries otherwise).
+  let routingContactInbox = contactInbox
+  try {
+    routingContactInbox = await threadControlService.refreshForRouting({
+      workspaceId: conversation.workspaceId,
+      contactInbox,
+    })
+    // Escape hatch: the agent dismissed the standby lock because our stored
+    // routing state may be stale. Skip the gate; a successful send still
+    // goes through recordServiceSent below (implicit take).
+    const messageMetadata = message.contentAttributes?.metadata
+    const bypassLock =
+      typeof messageMetadata === "object" &&
+      messageMetadata !== null &&
+      "bypassThreadControlLock" in messageMetadata &&
+      messageMetadata.bypassThreadControlLock === true
+    // A public comment reply is not a message on the routed DM thread, so
+    // thread ownership must not block it. A private-reply DM is also
+    // `type === "comment"` but IS a DM on that thread — it stays gated.
+    const isPublicComment =
+      message.type === "comment" && !isDirectMessage(message)
+    if (!(bypassLock || isPublicComment)) {
+      assertThreadOpenForServiceMessage(routingContactInbox, {
+        isTemplateMessage: false,
+      })
+    }
+
+    const { integration, ctx } =
+      await resolveIntegrationContextFromContactInbox({
+        workspaceId: conversation.workspaceId,
+        contactInbox,
+      })
+
+    const isComment = message.type === "comment"
+
+    let handlerMessage = message
+    if (isComment && message.parentId && message.parentCreatedAt) {
+      const parentMsg = await messageService.findWithAttachments({
+        id: message.parentId,
+        createdAt: new Date(message.parentCreatedAt),
+        workspaceId: conversation.workspaceId,
+      })
+      handlerMessage = {
+        ...message,
+        contentAttributes: {
+          ...message.contentAttributes,
+          replyToCommentId:
+            parentMsg?.sourceId ??
+            message.contentAttributes?.replyToCommentId ??
+            null,
+          // The post the parent comment belongs to, carried the same way
+          // `changeMessageStateOnChannel` carries it for `hideComment`.
+          // TikTok's reply endpoint is addressed by (video_id, comment_id),
+          // and `receiveComment` stamps the video id onto the incoming comment
+          // itself — a stronger source than the conversation, which a channel
+          // that reuses `sourceId` for something else can leave without one.
+          // Meta ignores it.
+          postId:
+            (typeof parentMsg?.contentAttributes?.postId === "string"
+              ? parentMsg.contentAttributes.postId
+              : undefined) ??
+            message.contentAttributes?.postId ??
+            null,
+        },
+      }
+    }
+
+    if (!isComment && contactInbox.channel === channelTypes.enum.smtp) {
+      handlerMessage = await withEmailThread({
+        message: handlerMessage,
+        conversation,
+        contactInboxId: contactInbox.id,
+      })
+    }
+
+    const handlerData = {
+      ctx,
+      data: {
+        contact: {
+          ...contactInbox,
+          sourceConversationId: resolveSourceConversationId(
+            conversation,
+            contactInbox.channel,
+          ),
+        },
+        message: handlerMessage,
+        quickReplies: isComment ? undefined : quickReplies,
+        metadata,
+        sendFrom,
+      },
+    }
+
+    const isPrivateReply =
+      isComment && handlerMessage.contentAttributes?.isPrivateReply === true
+
+    // Captured BEFORE dispatch so an implicit take (`recordServiceSent`) is
+    // stamped at send time, not after — see that function's `dispatchedAt`.
+    const dispatchedAt = new Date()
+    let result: OutgoingSendResult
+    if (isPrivateReply) {
+      // Only offered by the Inbox on a channel that implements the handler —
+      // see `canPrivateReplyToComment` in the builder. Threads has no DM API,
+      // and TikTok accepts one only for a comment it flagged as high intent.
+      //
+      // On TikTok this DM also comes back as an `im_send_msg` echo and is
+      // stored a second time, on the DM conversation rather than the comment
+      // one. Two rows for one send is the expected shape there, not a bug.
+      result = await integration.runChannelHandler(
+        "comment",
+        "sendPrivateReply",
+        handlerData,
+      )
+    } else if (isComment) {
+      result = await integration.runChannelHandler(
+        "comment",
+        "sendComment",
+        handlerData,
+      )
+    } else {
+      result = await integration.runChannelHandler(
+        "message",
+        "sendMessage",
+        handlerData,
+      )
+    }
+
+    // The channel accepted the message. Tell the composer right away (before
+    // any bookkeeping) so its send queue can move on.
+    await publishInboxSendConfirmation({
+      sendFrom,
+      silent: isBulkOutbound,
+      conversation,
+      message,
+    })
+
+    // Everything below is bookkeeping for a message that is already delivered:
+    // a failure here must neither mark it failed nor rethrow into a retry, which
+    // would send it a second time.
+    try {
+      if (isComment) {
+        // When the outgoing message is a comment reply, store the Facebook comment
+        // ID of the new reply so the page manager can edit/delete it later.
+        const replyId = result.messageIds[0]
+        if (message.parentId && replyId && message.id) {
+          // The reply was already sent successfully — a failure past this
+          // point must never rethrow, or BullMQ retries the whole job and
+          // sendComment fires again, posting a second live duplicate reply.
+          try {
+            await messageService.updateSourceId({
+              id: message.id,
+              sourceId: replyId,
+              workspaceId: conversation.workspaceId,
+              createdAt: new Date(message.createdAt),
+            })
+
+            // Notify the client so edit/delete buttons appear immediately without a refresh.
+            await queueConversationScopedMessageEvent({
+              workspaceId: conversation.workspaceId,
+              conversationId: conversation.id,
+              eventType: RealtimeEventType.messageIdAssigned,
+              data: { messageId: message.id, commentId: replyId },
+            })
+
+            if (attemptsMade > 0) {
+              await clearMessageSendError(
+                message.id,
+                message.clientId,
+                conversation.workspaceId,
+                new Date(message.createdAt),
+                { conversationId: conversation.id, silent: isBulkOutbound },
+              )
+            }
+          } catch (err) {
+            logger.error(
+              err,
+              "Failed to persist comment reply sourceId after a successful send",
+            )
+          }
+        }
+      } else {
+        // Persist the provider message id as this row's sourceId. The channel
+        // echoes every page-sent message back via webhook (coexist); the echo
+        // handler dedups through createOrUpdate → findBySourceId. Without a
+        // sourceId here, bot/agent outgoing rows stay sourceId=null, the echo
+        // lookup misses, and a duplicate row is inserted as senderType=user.
+        await updateMessageSourceId(
+          message.id,
+          conversation.workspaceId,
+          new Date(message.createdAt),
+          result,
+        )
+
+        if (attemptsMade > 0) {
+          await clearMessageSendError(
+            message.id,
+            message.clientId,
+            conversation.workspaceId,
+            new Date(message.createdAt),
+            { conversationId: conversation.id, silent: isBulkOutbound },
+          )
+        }
+      }
+
+      await contactInboxService.recordOutboundMessageSent({
+        contactInboxId: contactInbox.id,
+        contactId: contactInbox.contactId,
+        workspaceId: conversation.workspaceId,
+        at: message.createdAt ?? new Date(),
+      })
+
+      // A public comment reply reaches no one's inbox; a private reply does.
+      if (!isComment || isPrivateReply) {
+        await recordDeliveredWhenNoReceipts({
+          contactInbox,
+          sentCount: result.sentCount,
+          workspaceId: conversation.workspaceId,
+        })
+      }
+
+      if (!isComment) {
+        await recordServiceSent({
+          conversation,
+          contactInbox: routingContactInbox,
+          isTemplateMessage: false,
+          dispatchedAt,
+        })
+      }
+
+      if (isDeliveredDirectMessage({ message, result })) {
+        await markConversationReadAfterDelivery({
+          workspaceId: conversation.workspaceId,
+          conversationId: conversation.id,
+          inboxId: contactInbox.inboxId,
+          readAt: new Date(message.createdAt),
+          silent: isBulkOutbound,
+        })
+      }
+
+      // The other half of the cross-queue anchor: the integration worker recorded
+      // the attempt optimistically and only this handler knows the Graph API
+      // accepted it. Meta sends no delivery receipt for a public comment reply,
+      // so this is the automation's only delivery signal.
+      await settleCommentAutomationDelivered({
+        contentAttributes: message?.contentAttributes,
+      })
+
+      if (!isComment) {
+        try {
+          await contactService.unblockIfBlocked({
+            workspaceId: conversation.workspaceId,
+            id: conversation.contactId,
+          })
+        } catch (error) {
+          logger.warn(error, "Auto-unblock on successful send failed")
+        }
+      }
+    } catch (err) {
+      logger.error(
+        { err, messageId: message.id, workspaceId: conversation.workspaceId },
+        "Post-send bookkeeping failed after the channel accepted the message",
+      )
+    }
+
+    // Quota and agent stats in their own block: a failure in the bookkeeping
+    // above must not also skip counting a message that was delivered.
+    try {
+      // Bot-message quota accounting: `chat/worker.ts`'s pre-send gate blocks this
+      // job type when `senderType === "bot"` (`isBotMessageQuotaReached`), but
+      // nothing previously counted it — the quota gate and the quota meter must
+      // stay structurally paired or the gate is enforced against a counter that
+      // never moves. Human-sent messages (senderType !== "bot") are unaffected.
+      if (message.senderType === "bot") {
+        await emitBotMessageSentEvents({
+          workspaceId: conversation.workspaceId,
+          contactInbox,
+          result,
+          trigger: {
+            triggerHandler: "sendMessageToChannel",
+            triggerType: "message_bot_sent_channel",
+          },
+        })
+      } else if (message.senderType === "user" && message.senderId) {
+        // A workspace member's message from the inbox composer. `api` and
+        // `system` senders are not human agents and stay out of agent stats.
+        await emitHumanMessageSentEvents({
+          workspaceId: conversation.workspaceId,
+          contactInbox,
+          result,
+          trigger: {
+            triggerHandler: "sendMessageToChannel",
+            triggerType: "message_human_sent_channel",
+          },
+          adminId: message.senderId,
+          messageId: message.id,
+          occurredAt: new Date(message.createdAt),
+        })
+      }
+    } catch (err) {
+      logger.error(
+        { err, messageId: message.id, workspaceId: conversation.workspaceId },
+        "Post-send bookkeeping failed after the channel accepted the message",
+      )
+    }
+
+    return result
+  } catch (error) {
+    // A reconciled failure is a permanent, known outcome: it is still
+    // recorded below, but never rethrown into a retry.
+    const isReconciledSendError = await reconcileChannelSendError({
+      error,
+      conversation,
+      contactInbox: routingContactInbox,
+      contentAttributes: message.contentAttributes,
+      metadata,
+    })
+    logger.error(error, "An error occurred while sending the message")
+    const errorData = await parseSdkError(error)
+    // A reconciled error returns instead of throwing, so it is never retried.
+    const willRetry =
+      !isReconciledSendError &&
+      willSendRetry({
+        error,
+        channel: contactInbox.channel,
+        willRetryOnThrow,
+      })
+    await emit(messageEventTypeSchema.enum["message:failed"], {
+      context: {
+        workspaceId: conversation.workspaceId,
+        contactId: conversation.contactId,
+        conversationId: conversation.id,
+        channel: contactInbox.channel,
+        contactInboxId: contactInbox.id,
+        inboxId: contactInbox.inboxId,
+        sourceId: contactInbox.sourceId,
+      },
+      action: {
+        messageId: message?.id ?? "",
+      },
+      errorData,
+      // Captured here while the throw is still in hand: `errorData` is a
+      // stackless `ParsedError`, so `ErrorLog.stackTrace` has no other source.
+      errorStack: resolveStackFrames(error),
+      occurredAt: new Date(),
+      metadata,
+      willRetry,
+    })
+    // Only the FINAL failure settles the row: while the job will still be
+    // retried it may yet go out, and an error badge now would invite a Resend
+    // that duplicates it. A member's Inbox message is kept with its error;
+    // any other is removed (its error goes to the Error Log via the
+    // `message:failed` above).
+    await settleFailedOutgoingMessage({
+      message,
+      conversationId: conversation.id,
+      workspaceId: conversation.workspaceId,
+      errorMessage: errorData.message,
+      sendFrom,
+      silent: isBulkOutbound,
+      willRetry,
+    })
+    // Terminal failures only: an attempt that is about to be retried must not
+    // put a row in the automation's Error Logs for a reply that still lands.
+    if (!willRetry) {
+      await settleCommentAutomationFailure({
+        contentAttributes: message?.contentAttributes,
+        errorDetail: errorData.message,
+      })
+    }
+    if (
+      isReconciledSendError ||
+      shouldSuppressRetryableChannelError(error, contactInbox.channel)
+    ) {
+      return { messageIds: [], sentCount: 0 }
+    }
+    throw error
+  }
+}
+
+export async function deleteMessageFromChannel(
+  data: ChatJobDeleteChannelMessage["data"],
+) {
+  const { conversation, contactInbox, message, moderation } = data
+
+  const found = await messageService.findWithAttachments({
+    id: message.id,
+    createdAt: new Date(message.createdAt),
+    workspaceId: conversation.workspaceId,
+  })
+
+  if (!found) {
+    logger.warn(
+      { messageId: message.id },
+      "deleteMessageFromChannel: message not found in shard",
+    )
+    await failCommentModeration(
+      conversation.workspaceId,
+      moderation,
+      "Comment message not found",
+    )
+    return
+  }
+
+  if (found.type !== "comment" || !found.sourceId) {
+    logger.warn(
+      { messageId: message.id, type: found.type },
+      "deleteMessageFromChannel: message is not a comment or has no sourceId, skipping",
+    )
+    await failCommentModeration(
+      conversation.workspaceId,
+      moderation,
+      "Message is not a comment",
+    )
+    return
+  }
+
+  const commentId = found.sourceId
+  // The integration lookup sits inside the settle as well: a disconnected
+  // channel must fail the moderation log, not leave it pending.
+  await settleCommentModeration(
+    conversation.workspaceId,
+    moderation,
+    (async () => {
+      const { integration, ctx } =
+        await resolveIntegrationContextFromContactInbox({
+          workspaceId: conversation.workspaceId,
+          contactInbox,
+        })
+      await integration.runChannelHandler("comment", "deleteComment", {
+        ctx,
+        data: { commentId },
+      })
+    })(),
+  )
+
+  if (moderation) {
+    await removeModeratedCommentFromInbox(conversation, found)
+  }
+}
+
+/**
+ * The builder's delete action soft-deletes the inbox row before it enqueues
+ * the channel delete; a moderation delete has no such caller, so it does the
+ * same here once the channel accepted it.
+ */
+async function removeModeratedCommentFromInbox(
+  conversation: ConversationModel,
+  found: Pick<MessageModel, "id" | "sourceId" | "createdAt">,
+): Promise<void> {
+  try {
+    const deleted = await messageService.delete({
+      id: found.id,
+      sourceId: found.sourceId ?? undefined,
+      workspaceId: conversation.workspaceId,
+      createdAt: found.createdAt,
+    })
+    queueWorkspaceRealtimeEvent(conversation.workspaceId, {
+      eventType: RealtimeEventType.messageDeleted,
+      data: { messageIds: deleted.map((row) => row.id) },
+      route: routeForConversation(conversation),
+    })
+  } catch (err) {
+    logger.warn(
+      { err, messageId: found.id },
+      "deleteMessageFromChannel: failed to remove the moderated comment from the inbox",
+    )
+  }
+}
+
+export async function editMessageFromChannel(
+  data: ChatJobEditChannelMessage["data"],
+) {
+  const { conversation, contactInbox, message, newText, newAttachmentUrl } =
+    data
+
+  const found = await messageService.findWithAttachments({
+    id: message.id,
+    createdAt: new Date(message.createdAt),
+    workspaceId: conversation.workspaceId,
+  })
+
+  if (!found) {
+    logger.warn(
+      { messageId: message.id },
+      "editMessageFromChannel: message not found in shard",
+    )
+    return
+  }
+
+  if (found.type !== "comment" || !found.sourceId) {
+    logger.warn(
+      { messageId: message.id, type: found.type },
+      "editMessageFromChannel: message is not a comment or has no sourceId, skipping",
+    )
+    return
+  }
+
+  const { integration, ctx } = await resolveIntegrationContextFromContactInbox({
+    workspaceId: conversation.workspaceId,
+    contactInbox,
+  })
+
+  await integration.runChannelHandler("comment", "editComment", {
+    ctx,
+    data: { commentId: found.sourceId, newText, newAttachmentUrl },
+  })
+}
+
+export async function changeMessageStateOnChannel(
+  data: ChatJobChangeChannelMessageState["data"],
+) {
+  const { conversation, contactInbox, message, liked, hidden, moderation } =
+    data
+
+  const found = await messageService.findWithAttachments({
+    id: message.id,
+    createdAt: new Date(message.createdAt),
+    workspaceId: conversation.workspaceId,
+  })
+
+  if (!found) {
+    logger.warn(
+      { messageId: message.id },
+      "changeMessageStateOnChannel: message not found in shard",
+    )
+    await failCommentModeration(
+      conversation.workspaceId,
+      moderation,
+      "Comment message not found",
+    )
+    return
+  }
+
+  if (found.type !== "comment" || !found.sourceId) {
+    logger.warn(
+      { messageId: message.id, type: found.type },
+      "changeMessageStateOnChannel: message is not a comment or has no sourceId, skipping",
+    )
+    await failCommentModeration(
+      conversation.workspaceId,
+      moderation,
+      "Message is not a comment",
+    )
+    return
+  }
+
+  const commentId = found.sourceId
+  // Everything that can fail — the attribute write, the integration lookup,
+  // the channel calls — settles the moderation log, so none leaves it pending.
+  await settleCommentModeration(
+    conversation.workspaceId,
+    moderation,
+    (async () => {
+      const current =
+        (found.attributes as { liked?: boolean; hidden?: boolean } | null) ?? {}
+      const newAttributes = {
+        liked: liked === undefined ? (current.liked ?? false) : liked,
+        hidden: hidden === undefined ? (current.hidden ?? false) : hidden,
+      }
+      await messageService.updateAttributes({
+        id: message.id,
+        workspaceId: conversation.workspaceId,
+        attributes: newAttributes,
+        createdAt: found.createdAt,
+      })
+
+      const { integration, ctx } =
+        await resolveIntegrationContextFromContactInbox({
+          workspaceId: conversation.workspaceId,
+          contactInbox,
+        })
+
+      const calls: Promise<void>[] = []
+      if (liked !== undefined) {
+        calls.push(
+          integration.runChannelHandler("comment", "likeComment", {
+            ctx,
+            data: { commentId, liked },
+          }),
+        )
+      }
+      if (hidden !== undefined) {
+        calls.push(
+          integration.runChannelHandler("comment", "hideComment", {
+            ctx,
+            data: {
+              commentId,
+              hidden,
+              // TikTok's hide endpoint is addressed by (video_id, comment_id);
+              // Meta's by comment id alone and ignores this.
+              postId:
+                typeof found.contentAttributes?.postId === "string"
+                  ? found.contentAttributes.postId
+                  : undefined,
+            },
+          }),
+        )
+      }
+      await Promise.all(calls)
+    })(),
+  )
+}
+
+/**
+ * WhatsApp has no standalone typing/read API: both the typing indicator and
+ * the "Seen" receipt ride on marking a real inbound message read, so both
+ * callers (this file's `sendTypingToChannel` and the Mark Read step handler)
+ * need that message's wamid. Other channels don't anchor on a message id.
+ */
+export async function resolveWhatsappMessageSourceId(props: {
+  conversation: Pick<
+    ConversationModel,
+    "id" | "workspaceId" | "lastActivityAt" | "createdAt"
+  >
+  contactInbox: Pick<ContactInboxModel, "id" | "channel">
+}): Promise<string | undefined> {
+  const { conversation, contactInbox } = props
+  return contactInbox.channel === channelTypes.enum.whatsapp
+    ? await conversationService.findLastIncomingMessageSourceId({
+        conversation,
+        contactInboxId: contactInbox.id,
+      })
+    : undefined
+}
+
+export async function sendTypingToChannel(data: ChatJobSendTyping["data"]) {
+  const { conversation, contactInbox, typing, seconds } = data
+
+  if (!allIntegrations[contactInbox.channel]) {
+    // Typing is best-effort; missing integration is logged but not fatal.
+    logger.debug(
+      `No integration registered for typing on channel: ${contactInbox.channel}`,
+    )
+    return
+  }
+
+  const { integration, ctx } = await resolveIntegrationContextFromContactInbox({
+    workspaceId: conversation.workspaceId,
+    contactInbox,
+  })
+
+  const messageSourceId = await resolveWhatsappMessageSourceId({
+    conversation,
+    contactInbox,
+  })
+
+  await integration.runChannelHandler("conversation", "sendTyping", {
+    ctx,
+    data: { contact: contactInbox, typing, seconds, messageSourceId },
+  })
+}
+
+const queueConversationScopedMessageEvent = async (input: {
+  workspaceId: string
+  conversationId: string
+  eventType:
+    | typeof RealtimeEventType.messageFailed
+    | typeof RealtimeEventType.messageIdAssigned
+    | typeof RealtimeEventType.messageRemoved
+  data:
+    | Extract<
+        RealtimeEventData,
+        { eventType: typeof RealtimeEventType.messageFailed }
+      >["data"]
+    | Extract<
+        RealtimeEventData,
+        { eventType: typeof RealtimeEventType.messageIdAssigned }
+      >["data"]
+    | Extract<
+        RealtimeEventData,
+        { eventType: typeof RealtimeEventType.messageRemoved }
+      >["data"]
+}): Promise<void> => {
+  try {
+    const conversation = await conversationService.findBy({
+      where: {
+        id: input.conversationId,
+        workspaceId: input.workspaceId,
+      },
+    })
+    queueWorkspaceRealtimeEvent(input.workspaceId, {
+      data: input.data,
+      eventType: input.eventType,
+      route: routeForConversation(conversation),
+    } as RealtimeEventData)
+  } catch (err) {
+    logger.error(
+      {
+        err,
+        conversationId: input.conversationId,
+        workspaceId: input.workspaceId,
+      },
+      "Failed to resolve current conversation route for realtime event",
+    )
+  }
+}
+
+/**
+ * Success signal for a message typed in the inbox: the existing `messageFailed`
+ * event with `error: null`, which the builder already reads as "no error". It
+ * is the composer queue's only "this message was accepted" signal, so it is
+ * published for inbox sends only (broadcasts, flows and sequences stay silent).
+ */
+const publishInboxSendConfirmation = async (input: {
+  sendFrom: ChatJobSendChannelMessage["data"]["sendFrom"]
+  silent: boolean
+  conversation: Pick<ConversationModel, "id" | "workspaceId">
+  message: Pick<MessageModel, "id"> & { clientId?: string | undefined }
+}): Promise<void> => {
+  if (!isManualSend(input.sendFrom) || input.silent) {
+    return
+  }
+  try {
+    await queueConversationScopedMessageEvent({
+      workspaceId: input.conversation.workspaceId,
+      conversationId: input.conversation.id,
+      eventType: RealtimeEventType.messageFailed,
+      data: {
+        messageId: input.message.id,
+        clientId: input.message.clientId,
+        error: null,
+      },
+    })
+  } catch (err) {
+    logger.warn(
+      { err, messageId: input.message.id },
+      "Failed to publish the inbox send confirmation",
+    )
+  }
+}
+
+const MAX_SEND_ERROR_LENGTH = 500
+
+const persistMessageSendError = async (input: {
+  clientId: string | undefined
+  conversationId: string
+  createdAt: Date | undefined
+  failureMessage: string
+  messageId: string | undefined
+  sendError: string | null
+  silent?: boolean
+  workspaceId: string
+}): Promise<void> => {
+  if (!(input.messageId && input.createdAt)) {
+    return
+  }
+  try {
+    await messageService.updateSendError({
+      id: input.messageId,
+      sendError: input.sendError,
+      workspaceId: input.workspaceId,
+      createdAt: input.createdAt,
+    })
+    if (input.silent) {
+      return
+    }
+    await queueConversationScopedMessageEvent({
+      workspaceId: input.workspaceId,
+      conversationId: input.conversationId,
+      eventType: RealtimeEventType.messageFailed,
+      data: {
+        messageId: input.messageId,
+        clientId: input.clientId,
+        error: input.sendError,
+      },
+    })
+  } catch (err) {
+    logger.error(
+      {
+        err,
+        messageId: input.messageId,
+        workspaceId: input.workspaceId,
+      },
+      input.failureMessage,
+    )
+  }
+}
+
+export const recordMessageSendError = async (
+  messageId: string | undefined,
+  clientId: string | undefined,
+  workspaceId: string,
+  createdAt: Date | undefined,
+  errorMessage: string,
+  options: { conversationId: string; silent?: boolean },
+): Promise<void> =>
+  persistMessageSendError({
+    clientId,
+    conversationId: options.conversationId,
+    createdAt,
+    failureMessage: "Failed to persist message sendError",
+    messageId,
+    sendError: errorMessage.slice(0, MAX_SEND_ERROR_LENGTH),
+    silent: options.silent,
+    workspaceId,
+  })
+
+type FailedOutgoingMessage = {
+  id?: string | undefined
+  clientId?: string | undefined
+  createdAt?: Date | string | null | undefined
+  contentAttributes?: unknown
+  senderType?: string | null | undefined
+}
+
+/**
+ * Whether a failed outgoing message stays in the conversation with its error.
+ * Only a message a workspace member sent from the builder's Inbox does — read
+ * from the job (`sendFrom`) or, for a retry or a late delivery-status
+ * callback, from the marker stamped on the row when it was created.
+ */
+export const shouldKeepFailedOutgoingMessage = (input: {
+  sendFrom?: SendFrom | undefined
+  contentAttributes?: unknown
+  senderType?: string | null | undefined
+}): boolean => {
+  if (input.sendFrom === "inbox" || isSentFromInbox(input.contentAttributes)) {
+    return true
+  }
+  if (input.sendFrom === "api") {
+    return false
+  }
+  // No job context (a late delivery status): a member's message from before the
+  // marker existed is kept rather than lost.
+  return isLegacyMemberMessage(input)
+}
+
+/**
+ * Settles the row of an outgoing message whose send failed. Shared by every
+ * send path so the rule is one rule:
+ *
+ * - `willRetry` — another attempt is coming: the row is left as it is.
+ * - kept ({@link shouldKeepFailedOutgoingMessage}) — `sendError` is written
+ *   and `messageFailed` published, as the Inbox has always shown.
+ * - otherwise — the row and its attachments are removed for good and
+ *   `messageRemoved` published (not for a bulk send, which publishes nothing).
+ *   The failure itself reaches the Error Log through the caller's
+ *   `message:failed` emit (bulk sends are skipped there).
+ *
+ * Never throws: it runs inside the caller's failure handling.
+ */
+export const settleFailedOutgoingMessage = async (input: {
+  message: FailedOutgoingMessage | undefined
+  conversationId: string
+  workspaceId: string
+  errorMessage: string
+  sendFrom?: SendFrom | undefined
+  /** A bulk (broadcast/sequence) send: no realtime event. */
+  silent?: boolean
+  willRetry?: boolean
+}): Promise<"kept" | "removed" | "pending" | "skipped"> => {
+  const { message } = input
+  if (input.willRetry) {
+    return "pending"
+  }
+  const createdAt = message?.createdAt ? new Date(message.createdAt) : undefined
+  if (!(message?.id && createdAt)) {
+    return "skipped"
+  }
+  if (
+    shouldKeepFailedOutgoingMessage({
+      sendFrom: input.sendFrom,
+      contentAttributes: message.contentAttributes,
+      senderType: message.senderType,
+    })
+  ) {
+    await recordMessageSendError(
+      message.id,
+      message.clientId,
+      input.workspaceId,
+      createdAt,
+      input.errorMessage,
+      { conversationId: input.conversationId, silent: input.silent },
+    )
+    return "kept"
+  }
+  await removeFailedOutgoingMessage({
+    messageId: message.id,
+    createdAt,
+    conversationId: input.conversationId,
+    workspaceId: input.workspaceId,
+    silent: input.silent,
+  })
+  return "removed"
+}
+
+/**
+ * {@link settleFailedOutgoingMessage} for the template senders, which insert a
+ * new row on every attempt. A failure that will be retried therefore removes
+ * this attempt's row (the next attempt writes its own), so a retried template
+ * never leaves a duplicate behind; the final failure settles as usual.
+ */
+export const settleFailedTemplateMessage = async (
+  input: Parameters<typeof settleFailedOutgoingMessage>[0],
+): Promise<"kept" | "removed" | "pending" | "skipped"> => {
+  if (!input.willRetry) {
+    return await settleFailedOutgoingMessage(input)
+  }
+  const { message } = input
+  const createdAt = message?.createdAt ? new Date(message.createdAt) : undefined
+  if (!(message?.id && createdAt)) {
+    return "skipped"
+  }
+  await removeFailedOutgoingMessage({
+    messageId: message.id,
+    createdAt,
+    conversationId: input.conversationId,
+    workspaceId: input.workspaceId,
+    silent: input.silent,
+  })
+  return "removed"
+}
+
+const removeFailedOutgoingMessage = async (input: {
+  messageId: string
+  createdAt: Date
+  conversationId: string
+  workspaceId: string
+  silent?: boolean
+}): Promise<void> => {
+  try {
+    await messageService.hardDelete({
+      id: input.messageId,
+      workspaceId: input.workspaceId,
+      createdAt: input.createdAt,
+    })
+    if (input.silent) {
+      return
+    }
+    await queueConversationScopedMessageEvent({
+      workspaceId: input.workspaceId,
+      conversationId: input.conversationId,
+      eventType: RealtimeEventType.messageRemoved,
+      data: { messageIds: [input.messageId] },
+    })
+  } catch (err) {
+    logger.error(
+      { err, messageId: input.messageId, workspaceId: input.workspaceId },
+      "Failed to remove a failed outgoing message",
+    )
+  }
+}
+
+const clearMessageSendError = async (
+  messageId: string | undefined,
+  clientId: string | undefined,
+  workspaceId: string,
+  createdAt: Date | undefined,
+  options: { conversationId: string; silent?: boolean },
+): Promise<void> =>
+  persistMessageSendError({
+    clientId,
+    conversationId: options.conversationId,
+    createdAt,
+    failureMessage: "Failed to clear message sendError after a retry succeeded",
+    messageId,
+    sendError: null,
+    silent: options.silent,
+    workspaceId,
+  })
+
+async function updateMessageSourceId(
+  messageId: string | undefined,
+  workspaceId: string,
+  createdAt: Date | undefined,
+  result: OutgoingSendResult,
+) {
+  const firstMessageId = result.messageIds[0]
+  if (!(messageId && firstMessageId && createdAt)) {
+    return
+  }
+  try {
+    const updated = result.email
+      ? await messageService.updateSourceIdAndEmail({
+          id: messageId,
+          sourceId: firstMessageId,
+          email: result.email,
+          workspaceId,
+          createdAt,
+        })
+      : await messageService.updateSourceId({
+          id: messageId,
+          sourceId: firstMessageId,
+          workspaceId,
+          createdAt,
+        })
+    if (!updated) {
+      throw new Error(
+        "Sent message was not found while recording its source ID",
+      )
+    }
+  } catch (err) {
+    logger.error(
+      { err, messageId, providerMessageId: firstMessageId, workspaceId },
+      "Failed to persist sent message source ID",
+    )
+  }
+}
+
+export type BotSentTrigger = {
+  triggerHandler: string
+  triggerType: string
+}
+
+type SentEventContactInbox = Pick<
+  ContactInboxModel,
+  "contactId" | "channel" | "inboxId" | "source" | "sourceId"
+>
+
+type SentEventSender =
+  | { kind: "bot" }
+  | {
+      kind: "human"
+      adminId: string
+      /**
+       * Persisted outgoing message: gives each sent part a stable identity, so
+       * a re-run job hits the same row. Without it the stream id is used.
+       */
+      messageId?: string
+      /** The message's own timestamp, so a re-run lands on the same row. */
+      occurredAt: Date
+    }
+
+/**
+ * Emits one `message:*_sent` analytics event per sent part. Runs after the
+ * channel has already accepted the send — a rejection here must never
+ * propagate into the caller's catch block, or a delivered message gets
+ * recorded as failed and BullMQ redelivers it, sending it twice.
+ *
+ * Human events carry a logical id (`<messageId>:<part index>`) and the
+ * message's own timestamp: a re-executed job gets a new Redis stream id, so
+ * stream-id dedup alone would count the same message twice.
+ */
+async function emitMessageSentEvents(input: {
+  workspaceId: string
+  contactInbox: SentEventContactInbox
+  result: OutgoingSendResult
+  trigger: BotSentTrigger
+  sender: SentEventSender
+}) {
+  const { workspaceId, contactInbox, result, trigger, sender } = input
+  const { sentCount, messageIds } = result
+
+  try {
+    await Promise.all(
+      Array.from({ length: sentCount }, (_, index) => {
+        const base = {
+          workspaceId,
+          contactId: contactInbox.contactId,
+          source: contactInbox.source,
+          sourceId: contactInbox.sourceId,
+          channel: contactInbox.channel,
+          inboxId: contactInbox.inboxId,
+          metadata: {
+            triggerContext: {
+              triggerSource: "worker",
+              triggerHandler: trigger.triggerHandler,
+              triggerType: trigger.triggerType,
+            },
+            ...(messageIds[index]
+              ? {
+                  sentPayload: {
+                    index,
+                    count: sentCount,
+                    providerMessageId: messageIds[index],
+                  },
+                }
+              : {}),
+          },
+        }
+        return sender.kind === "human"
+          ? emit("analytics:dashboard", {
+              ...base,
+              eventType: "message:human_sent",
+              senderType: "human",
+              adminId: sender.adminId,
+              ...(sender.messageId
+                ? { eventId: `${sender.messageId}:${index}` }
+                : {}),
+              occurredAt: sender.occurredAt,
+            })
+          : emit("analytics:dashboard", {
+              ...base,
+              eventType: "message:bot_sent",
+              senderType: "bot",
+              occurredAt: new Date(),
+            })
+      }),
+    )
+  } catch (err) {
+    logger.error(
+      { err, workspaceId, contactId: contactInbox.contactId, sentCount },
+      "Failed to emit sent analytics after a successful send",
+    )
+  }
+}
+
+export function emitBotMessageSentEvents(input: {
+  workspaceId: string
+  contactInbox: SentEventContactInbox
+  result: OutgoingSendResult
+  trigger: BotSentTrigger
+}) {
+  return emitMessageSentEvents({ ...input, sender: { kind: "bot" } })
+}
+
+/** A human agent's send (inbox composer, agent-initiated template). */
+export function emitHumanMessageSentEvents(input: {
+  workspaceId: string
+  contactInbox: SentEventContactInbox
+  result: OutgoingSendResult
+  trigger: BotSentTrigger
+  adminId: string
+  messageId?: string
+  occurredAt: Date
+}) {
+  const { adminId, messageId, occurredAt, ...rest } = input
+  return emitMessageSentEvents({
+    ...rest,
+    sender: { kind: "human", adminId, messageId, occurredAt },
+  })
+}
+
+export async function sendFlowStepToChannel({
+  conversation,
+  contactInbox,
+  flowId,
+  flowVersionId,
+  step,
+  productMessage,
+  quickReplies,
+  metadata,
+  richResponse,
+  messageId,
+  messageCreatedAt,
+  sendFrom,
+  commentAnchor,
+  botSentAnalytics,
+  humanSender,
+  isTemplateMessage = false,
+}: {
+  conversation: ConversationModel
+  contactInbox: ContactInboxModel
+  flowId: string
+  flowVersionId?: string
+  step: SendFlowStepData
+  /** Set for a `sendProducts` step: its products, resolved for this send. */
+  productMessage?: ResolvedProductMessage
+  quickReplies?: MessageButtonTemplate[]
+  metadata?: MetadataPayload
+  richResponse?: ChatJobSendFlowStep["data"]["richResponse"]
+  messageId?: string
+  messageCreatedAt?: Date
+  sendFrom?: SendFrom
+  commentAnchor?: CommentAnchor
+  botSentAnalytics: BotSentTrigger
+  /** Set when a workspace member triggered the send (see `ProcessWhatsappTemplateParams`). */
+  humanSender?: { adminId: string; occurredAt: Date }
+  /**
+   * True only for a WhatsApp template send, which any responder may make and
+   * which never changes thread ownership. Everything else is a Service send.
+   */
+  isTemplateMessage?: boolean
+}): Promise<OutgoingSendResult> {
+  // The caller's row is the flow step as it was loaded; a handover may have
+  // landed since. Re-read the current routing state (zero queries when the
+  // thread has none) before the gate and the implicit-take record, exactly as
+  // `sendMessageToChannel` does — otherwise a flow send can dispatch into a
+  // thread a partner took over mid-flow.
+  const routingContactInbox = await threadControlService.refreshForRouting({
+    workspaceId: conversation.workspaceId,
+    contactInbox,
+  })
+  assertThreadOpenForServiceMessage(routingContactInbox, { isTemplateMessage })
+
+  const { integration, ctx } = await resolveIntegrationContextFromContactInbox({
+    workspaceId: conversation.workspaceId,
+    contactInbox,
+  })
+
+  let resolvedStep: SendFlowStepData = step
+
+  // `flow.id` is authoritative: the stored `sourceId` can be stale after the
+  // step's Flow was switched, so it is only a fallback.
+  if (step.stepType === stepTypes.enum.whatsappFlow && step.flow.id) {
+    const sourceId = await whatsappFlowService.findSourceId({
+      id: step.flow.id,
+      workspaceId: conversation.workspaceId,
+    })
+    if (sourceId) {
+      resolvedStep = { ...step, flow: { ...step.flow, sourceId } }
+    }
+  }
+
+  // SMTP replies use one stored message as their complete parent so flow sends
+  // and inbox sends produce identical RFC 5322 threading headers.
+  const emailThread =
+    contactInbox.channel === channelTypes.enum.smtp
+      ? await conversationService.findEmailReplyParent({
+          conversation,
+          contactInboxId: contactInbox.id,
+        })
+      : undefined
+
+  // Captured BEFORE dispatch — see `recordServiceSent`'s `dispatchedAt`.
+  const dispatchedAt = new Date()
+  let result: OutgoingSendResult
+  try {
+    result = await integration.runChannelHandler("message", "sendFlowStep", {
+      ctx,
+      data: {
+        contact: {
+          ...contactInbox,
+          sourceConversationId: resolveSourceConversationId(
+            conversation,
+            contactInbox.channel,
+          ),
+        },
+        flowId,
+        flowVersionId,
+        step: resolvedStep,
+        productMessage,
+        quickReplies,
+        metadata,
+        richResponse,
+        sendFrom,
+        commentAnchor,
+        emailThread,
+      },
+    })
+  } catch (error) {
+    // The same reconciliation `sendMessageToChannel` runs, so both chokepoints
+    // learn from a rejected send. Its verdict is ignored: this function has
+    // always rethrown, and the caller owns the failure handling.
+    await reconcileChannelSendError({
+      error,
+      conversation,
+      contactInbox,
+      contentAttributes: undefined,
+      metadata,
+    })
+    throw error
+  }
+
+  await updateMessageSourceId(
+    messageId,
+    conversation.workspaceId,
+    messageCreatedAt,
+    result,
+  )
+  await contactInboxService.recordOutboundMessageSent({
+    contactInboxId: contactInbox.id,
+    contactId: contactInbox.contactId,
+    workspaceId: conversation.workspaceId,
+    at: new Date(),
+  })
+
+  await recordDeliveredWhenNoReceipts({
+    contactInbox,
+    sentCount: result.sentCount,
+    workspaceId: conversation.workspaceId,
+  })
+
+  await recordServiceSent({
+    conversation,
+    contactInbox: routingContactInbox,
+    isTemplateMessage,
+    dispatchedAt,
+  })
+
+  // A member's send is always a human message, even without a persisted id.
+  if (humanSender) {
+    await emitHumanMessageSentEvents({
+      workspaceId: conversation.workspaceId,
+      contactInbox,
+      result,
+      trigger: botSentAnalytics,
+      adminId: humanSender.adminId,
+      messageId,
+      occurredAt: humanSender.occurredAt,
+    })
+  } else {
+    await emitBotMessageSentEvents({
+      workspaceId: conversation.workspaceId,
+      contactInbox,
+      result,
+      trigger: botSentAnalytics,
+    })
+  }
+
+  return result
+}

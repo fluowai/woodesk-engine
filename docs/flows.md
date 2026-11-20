@@ -1,0 +1,345 @@
+# Flow versions
+
+This document describes the flow editor data model and the version lifecycle used by
+the builder. It is the reference for draft editing, publishing, restoring older
+versions, and reverting a draft back to the current published content.
+
+## Tables
+
+| Table | File | Role |
+|---|---|---|
+| `flowModel` | [`packages/database/src/schema/flow.ts`](../packages/database/src/schema/flow.ts) | Flow metadata and version pointers (`currentVersionId`, `draftVersionId`). |
+| `flowVersionModel` | [`packages/database/src/schema/flow-version.ts`](../packages/database/src/schema/flow-version.ts) | Version payload (`nodes`, `edges`, `startNodeId`) plus lifecycle flags (`isDraft`, `isLatest`). |
+
+## Invariants
+
+- Exactly one draft row exists per flow: `flowVersionModel.isDraft = true`.
+- At most one published row is current: `flowVersionModel.isDraft = false` and
+  `flowVersionModel.isLatest = true`.
+- `flowModel.currentVersionId` points to the current published version when one exists.
+- Published rows are immutable snapshots. Editing only mutates the draft row.
+
+## Lifecycle
+
+| Operation | Code path | Behavior |
+|---|---|---|
+| Create | `createFlowAction` / public `flows.create` | Inserts the flow and a single draft version. The builder form and a bare API call seed it with a default start node; the public API can instead seed the draft with `{ spec }` or a raw `{ nodes, edges }` graph in the same call (see [Publish / validate workflow](#publish--validate-workflow)). No published version exists yet unless `publish: true` was sent. |
+| Edit / autosave | `updateDraftFlowVersionAction` | Overwrites the draft row's `nodes` and `edges` from the canvas. |
+| Publish | `publishFlowAction` | Copies the current draft content into a new published snapshot, marks it `isLatest`, and updates `currentVersionId`. |
+| Restore older version | `flowVersionService.restore()` | Marks the chosen version as current published, updates `currentVersionId`, and copies that version's content into the draft row. |
+| Revert draft to published | `flowVersionService.revertDraftToPublished()` | Copies the current published version's `nodes`, `edges`, and `startNodeId` back into the draft row without changing `currentVersionId` or the published pointer. |
+
+## Cache
+
+Published versions are cached under `flows:${flowId}:versions` via `withCache`
+in [`packages/business/src/flow-version/service.ts`](../packages/business/src/flow-version/service.ts).
+
+- `restore()` invalidates the versions cache because the published list changes.
+- `publishFlowAction` invalidates the versions cache because it creates a new published snapshot.
+- `revertDraftToPublished()` does not invalidate the versions cache because the published list does not change.
+
+## Draft vs published equality
+
+The flow editor decides whether the toolbar action can be used by comparing the draft
+content to the current published content at page load. The page loads all versions,
+finds the draft row and the current published row, and compares their serialized
+`nodes`/`edges` using [`serializeFlowContent`](../apps/builder/src/features/flows/flow-version-content.ts).
+
+That comparison is computed once when the page renders. After the user makes an edit,
+the toolbar becomes enabled immediately (no reload needed). It also disables again
+without a reload after a successful revert or restore, since the canvas content once
+again equals the published content.
+
+## Notes
+
+- The canvas reset path used by restore and revert clears undo/redo history.
+- The revert action is destructive from the user's perspective because it discards
+  local draft work, so the builder shows a confirmation dialog before executing it.
+
+## Button limits and button styles
+
+Each channel's flow policy (`packages/flow-config/src/channel-rules/policies/`) is the
+only place button limits live. `limits.buttonCount` caps a text or media step,
+`limits.cardButtonCount` caps a `sendCard` step and each card of a `sendCarousel`;
+`getButtonCountLimit(policy, "step" | "card")` is the one reader (publish, builder
+editors, the worker). Agents read both in `capabilities.get` →
+`selectedChannelPolicy.limits` (policy version 4).
+
+| Channel | Step buttons | Card buttons |
+|---|---|---|
+| LINE | 5 | 5 |
+| Telegram | 10 | 3 |
+| Every other channel (and omnichannel) | 3 | 3 |
+
+The card schema's own ceiling, `CARD_BUTTON_MAX` (`steps/button-limits.ts`), must
+equal the largest `cardButtonCount`; a test pins it. Publish rejects more buttons
+than the node's channel allows with the `constraintExceeded` / `maxButtonCount`
+capability error (path `…buttons`, or `…cards.<i>.buttons` for a carousel card).
+
+The node's channel is not enforced at send time, so a step can reach a contact on a
+channel that takes fewer buttons (a 5-button LINE node reached through a jump from
+another node). For **cards**, where the extra buttons make the channel's API reject
+the whole card, the worker (`clampCardButtonsToChannel`, called from `sendFlowStep`)
+keeps the leading buttons up to the **resolved** channel's `cardButtonCount` and logs
+a warning naming what it dropped. Text and media step buttons are not cut by the
+worker: each integration already handles that overflow itself (Messenger and
+Instagram send the first 3, TikTok and WhatsApp split into further messages, Zalo
+sends 5).
+
+A button may carry `style`: `primary`, `secondary` or `link`. A channel renders it
+only when its policy declares `buttonStyles` (`capabilities.get` →
+`selectedChannelPolicy.buttonStyles`, `null` elsewhere); today that is LINE, whose
+default for an unset style is `link`. The builder shows the style picker in the
+button dialog only on such a channel (never on quick replies). Everywhere else a
+stored style is ignored and never blocks publish. In a flow spec, set `style` on a
+`send` button.
+
+## Call Phone Number buttons
+
+A step button (`buttonType: "callPhoneNumber"`, or `call` in a flow spec) that dials
+a number when tapped. The number is either a real number in E.164 form
+(`+14155552671`, at most 16 characters; checked with libphonenumber when the flow is
+saved or published) or an expression embedding `{{variables}}` (at most 100
+characters) that is resolved, and validated the same way, when the message is sent.
+
+- **Native channels** (`capabilities.get` → `selectedChannelPolicy.nativeButtonTypes`
+  contains `callPhoneNumber`): Messenger (`phone_number`), Zalo (`oa.open.phone`,
+  digits without `+`) and webchat/inbox (`tel:` link). The device places the call;
+  the bot is not told about the tap. Native vs. reply is decided per delivery
+  channel, so an omnichannel node sent to one of these channels dials too.
+- **Every other channel** (Instagram, Telegram, TikTok, WhatsApp, API) sends an ordinary reply button whose title is `"{label} {number}"` when
+  that fits the channel's button-label limit, otherwise just the number. Tapping it
+  replies with the number as text, and the inbox stores it as that reply button,
+  not a dial link. The reply resolves `{{variables}}` again at tap
+  time, so if the value changed after the message was sent, the reply shows the
+  new number while the button title still shows the old one.
+- A number that does not resolve to a valid international number degrades to an
+  inert button (logged) rather than being dropped, so card button counts stay equal.
+- The button can neither continue the flow nor run additional steps, and it is
+  rejected on quick replies (node quick replies and `sendQuickReply` steps), on
+  WhatsApp / Messenger message-template steps and as the WhatsApp Flow button.
+
+## Copy Text buttons
+
+A step button (`buttonType: "copyText"`, or `copy` in a flow spec) that copies a
+text to the contact's clipboard when tapped — for example a PIX "copia e cola"
+payment code returned by a Call API step. The text is a literal of at most 256
+characters or an expression embedding `{{variables}}` (at most 1,000 characters
+authored) that is resolved when the message is sent.
+
+- **Native channels** (`selectedChannelPolicy.nativeButtonTypes` contains
+  `copyText`): Telegram, as an inline `copy_text` button (Bot API 7.11). The
+  device copies the text; the bot is not told about the tap. Telegram copies at
+  most 256 characters, so a resolved text that is empty or longer is sent as a
+  reply button instead (logged), and the inbox stores it as that reply button.
+- **Every other channel** sends an ordinary reply button. Tapping it replies with
+  the text as a message the contact can long-press to copy; the reply resolves
+  `{{variables}}` again at tap time. The inbox shows a stored native copy button
+  as a button that copies the text.
+- The builder offers the Copy Text action only on Telegram nodes. The schema
+  still accepts it on every channel (the reply fallback above), so a flow built
+  through the API or switched to another channel keeps working.
+- The button can neither continue the flow nor run additional steps, and it is
+  rejected in the same places as a Call Phone Number button (quick replies,
+  WhatsApp / Messenger message-template steps, the WhatsApp Flow button).
+
+## Channel capability validation
+
+Publishing, importing, and restoring a flow validate every message step against its
+selected channel. Unsupported blocks and channel limits reject the operation before
+the version becomes current; the builder shows a localized validation message, while
+the API returns a structured capability error.
+
+This also applies to existing published versions. Restoring a version that uses a
+block no longer supported by its channel now fails instead of making that version
+current. Update the version to a supported message block before restoring it.
+
+Threads has no direct-message delivery runtime, so every message step is unsupported
+for Threads. Flows can still use non-message steps for Threads.
+
+## Flow-spec DSL (agent authoring)
+
+Public API callers (typically an MCP agent) can author a flow as a compact JSON
+document — the **flow-spec DSL** — instead of building the raw `{ nodes, edges }`
+graph the builder canvas uses. The server compiles a spec into that same graph
+shape before publishing or updating the draft, via
+[`compileFlowSpec`](../packages/flow-config/src/authoring/compile.ts).
+
+### Shape
+
+```json
+{
+  "formatVersion": 1,
+  "name": "Welcome flow",
+  "channel": "whatsapp",
+  "steps": [ /* FlowStepSpec[] */ ]
+}
+```
+
+- `formatVersion` — always `1`.
+- `channel` — optional; omit for omnichannel. `sendTemplate` steps always send over
+  WhatsApp regardless of this value. A `sendViewCatalog` step in an omnichannel flow is
+  only sent to WhatsApp contacts (others skip it); set `channel` to check it at publish.
+- `steps` — ordered, executed from the flow's start node. At least one required.
+
+Validated by [`flowSpecSchema`](../packages/flow-config/src/authoring/spec-schema.ts).
+`GET /v1/schemas/flow-spec` returns the same step-type documentation at runtime,
+generated from each step schema's own `.describe()` rather than hand-maintained
+here, so it cannot drift from the schema.
+
+### Step types
+
+| Type | Terminal? | Notes |
+|---|---|---|
+| `send` | No | Text, image, or file, with optional `buttons`. Each button's `then` is a nested step list. A button may instead set `call` (an international number such as `+14155552671`, optionally with `{{variables}}`) to become a Call Phone Number button; `call` cannot be combined with `then`. See "Call Phone Number buttons". A button may also set `copy` (the text to copy, at most 256 characters once `{{variables}}` are resolved) to become a Copy Text button; `copy` cannot be combined with `then` or `call`. See "Copy Text buttons". A button may set `style` (see "Button limits and button styles"). How many buttons the flow's channel allows is its `limits.buttonCount` (3 when `channel` is omitted); a spec with more is rejected, drafts included. |
+| `sendTemplate` | No | Sends an existing WhatsApp template by `templateName`. The template must resolve (by name) to a workspace template with status `APPROVED`. |
+| `sendCollection` | No | A product carousel (Messenger): `collectionType` `automated` picks the products matching `conditions` (`name`, `categoryId`, `subcategoryId`, `vendorId`) when sent, `manual` the chosen `productIds`; at most 10, only what the web shop shows. Each card opens the product in the web shop signed for the contact (`{{shop_token}}`). A collection matching nothing is skipped. See `docs/ecommerce.md`. |
+| `sendProducts` | No | Sends catalog products (`display`: `products` or `carousel`) by ChatbotX product id; get ids from `products.listSendable`. Needs a `channel` that supports product messages (WhatsApp); omnichannel flows reject it. Limits per channel come from `capabilities.get`. See `docs/product-messages.md`. |
+| `sendViewCatalog` | No | Shares the product catalog: a message (`text`, optional `footer`) with a button that opens it. Optional `thumbnailProductId` is a catalog item's `retailerId` from `products.searchMetaCatalogItems`. Publish rejects it on channels that cannot deliver it (WhatsApp is the only one today; see `capabilities.get`'s `unsupportedSteps`). In an omnichannel flow (`channel` omitted) it is accepted but only sent to WhatsApp contacts; other contacts skip it. Set `channel: "whatsapp"` to get the publish-time check. |
+| `wait` | No | Pauses for a duration before continuing. |
+| `branch` | **Yes** | Contact-filter-style `cases` (`when`/`match`/`then`) plus an `otherwise`. Terminal within its own step list — nothing may follow a `branch` at the same level; continue inside `cases[].then` / `otherwise` instead. |
+| `action` | No | A workspace side-effect: `addTags`, `removeTags`, `setCustomField`, `assignConversation`, `archiveConversation`. `setCustomField` takes an optional `operation` (default `set`): `set`, `append`/`prepend` (text), `increase`/`decrease`/`formula` (number), `setNow`/`dateExpression`/`addMinutes`/`addHours`/`addDays` (date, datetime) or `clear`; the field's type must support it (`invalidFieldOperation` otherwise) and `value` is optional only for `clear` and `setNow`. `formula` evaluates math with `value` as the current number (e.g. `round(value * 1.1)`); `dateExpression` evaluates e.g. `now + 2 days - 3 hours`. |
+| `pipeline` | No | A Pipelines (CRM kanban) action for the contact, one of the 14 `action`s of the Pipelines flow step (`addToPipeline`, `moveToStage`, `changeValue`, `assign`, `changeStatus`, `changePriority`, `changeDueDate`, `changeTitle`, `setCustomField`, `clearCustomField`, `changeDescription`, `removeFromPipeline`, `addComment`, `transfer`). References are by name, never id: `pipeline` is a pipeline `referenceName` (an id also works), `stage`/`destinationStage` a stage name in that pipeline, `field`/`fields`/`fieldValues[].field` pipeline custom field `referenceName`s (all from `pipelines.get`), `dueDate` is `{ mode: "none" }`, `{ mode: "fixed", at }` or `{ mode: "customField", customFieldName }` (a contact date/datetime custom field). Assignees are workspace member ids (`workspaceMembers.list`) and inbox team ids (`inboxTeams.list`). Each action's required fields are validated with spec paths (e.g. `steps[1].stage`), and fields an action does not use are rejected. Success continues to the next step; optional `onError` / `onSkip` step lists run when the action fails or the contact has no open item (skip). `onSkip` is rejected for `addToPipeline`, which never skips. Unknown pipeline/stage/field names fail with `unknownPipeline` / `unknownPipelineStage` / `unknownPipelineField` (or `ambiguousPipelineStage` when two stages share a name) and candidate names. See `docs/pipelines.md`. |
+| `startFlow` | No | Starts another flow (by `flowName`); this flow keeps running afterward. |
+| `addNote` | No | Adds an internal note to the conversation. |
+| `goto` | **Yes** | Routes to an already-defined step's `id` instead of continuing linearly. See constraints below. |
+
+"Terminal" means nothing may follow that step in the same step list — the compiler
+reports `unreachableStep` for anything after it. A step list opening with a
+non-terminal step continues into the node-level "Continue" edge by default.
+
+### `goto` semantics and constraints
+
+- Targets an earlier step's explicit `id` — set `id` on any step to make it a valid
+  `goto` target. `goto` creates no node of its own; it returns the id of the node its
+  target step already compiled to.
+- **Cannot be the first step** in the whole spec (`invalidFirstStep`) — there is no
+  earlier step yet to jump from.
+- **Must reference a real, earlier-declared step id** (`invalidGotoTarget`) — an
+  unknown or forward-referenced id fails with a candidates list of near-miss ids.
+- **Cannot target the step immediately before it** (`selfLoopGoto`) — that would wire
+  a node's "Continue" edge to itself (`source === target`), a self-loop
+  `layoutNodes` can't position and that adds no behavior beyond letting the flow
+  continue into the preceding step by default. Jumping back over an earlier step
+  (not the one immediately before) is fine.
+- **A step can target its own id from inside its own children** — e.g. a `send`
+  step's button `then` can `goto` back to that same `send` step's `id` (a "Back to
+  menu" pattern), and a `branch` case's `then` can `goto` back to its own `branch`
+  step. This works because the compiler registers a step's `id → nodeId` mapping
+  before compiling its nested children, not after.
+
+### Publish / validate workflow
+
+1. **`flows.create`** — accepts `name`/`folderId` plus, optionally, exactly one of
+   `{ spec }` or a raw `{ nodes, edges }` graph to seed the draft in the same call
+   (a body carrying both, or `edges` without `nodes`, is rejected with a 422 naming
+   the offending key). For the raw graph shape, node `position`/`measured`, node
+   ids, and edge `id`/handles are all optional or caller-arbitrary — filled in or
+   remapped server-side by
+   [`normalizeAuthoredGraph`](../packages/flow-config/src/authoring/normalize-graph.ts),
+   which lays out positionless nodes with the same BFS `layoutNodes` the spec
+   compiler uses, remaps every node's caller-supplied `id` to a fresh internal
+   `createId()` id (a raw node's `id` is only a request-scoped token for wiring
+   `edges` — it is never the persisted id, since persisted node ids are numeric
+   snowflakes and a caller id like `"n1"` would otherwise fail `publishFlowSchema`),
+   and defaults edge handles to the node-id convention `addHandleEdge` produces
+   against the remapped ids. The response's `nodeIds` maps each authored id to
+   its persisted id (present only for the raw-graph shape; omitted for `{
+   spec }` input, which has no authored ids). Add `publish: true` to validate
+   the resulting graph exactly like `flows.publish` and create the flow's
+   first version in the same call — the flow, its draft version, and its
+   published version are inserted in one transaction
+   (`FlowService.createPublished`/`createPublishedDefault`), so a downstream
+   failure never leaves an orphaned, unpublished flow behind. Omitting
+   content or `publish` keeps today's default-start-node draft behavior.
+2. **`flows.validate`** — compiles a `{ spec }` and validates the result exactly like
+   `flows.publish` would, without persisting anything. On success it returns the
+   compiled `{ nodes, edges }` graph; on failure a 422 with structured errors
+   (`path`/`code`/`message`/`hint`/`candidates`), each `path` remapped back onto the
+   *spec-relative* location (e.g. `steps[2].buttons[0].then[0]`) rather than a
+   compiled-node path. Fix and retry before publishing.
+3. **`flows.publish`** — accepts either the raw `{ nodes, edges }` graph the builder
+   UI sends, or `{ spec }`; a request must send exactly one of the two shapes — a
+   body carrying both is rejected with a 422 rather than silently discarding one of
+   them. Creates an immutable version from the draft and syncs the draft to match.
+4. **`flows.updateDraft`** — same either/or `{ nodes, edges }` vs `{ spec }`
+   acceptance as `flows.publish`, but overwrites the draft in place without
+   publishing; draft nodes are not otherwise validated. Unlike `flows.create`,
+   a raw node's `id` is persisted **verbatim, not remapped** — it must already
+   be a numeric string (`zodBigintAsString`), e.g. one returned by
+   `flows.create`'s `nodeIds` response or a `flows.get` call.
+
+The DSL compiler resolves `templateName`/`customFieldName`/`flowName` against the
+**entire workspace**, not a possibly-truncated capabilities page — see
+[`capabilities.get`](#capabilitiesget-workspace-discovery) below for how a caller
+discovers valid names before authoring a spec.
+
+## `capabilities.get` (workspace discovery)
+
+`GET /v1/capabilities` — implemented by
+[`getCapabilities`](../packages/business/src/capabilities/service.ts) — lets an
+agent discover the named entities and reference data it needs before calling other
+public APIs, in one compact, parallel-loaded response. It is the same shape of
+problem `listContactFilterFieldsForAPI` solves for contact filters, generalized to
+every named workspace entity an agent references by id.
+
+### `include`
+
+Accepts a subset of `CAPABILITIES_INCLUDES`: `inboxes`, `templates`,
+`customFields`, `botFields`, `tags`, `aiAgents`, `sequences`, `flows`, `flowSpec`.
+Omitting `include` fetches `DEFAULT_INCLUDES` — every entry except `aiAgents`, which
+is opt-in only (rarely needed to build a flow, one `ai_agents_list` call away).
+
+| `include` value | Returns |
+|---|---|
+| `inboxes` | `{ id, name, channel }[]` |
+| `templates` | `{ id, name, language, status, params }[]` — WhatsApp message templates |
+| `customFields` | `{ id, name, type }[]` |
+| `botFields` | `{ id, name, type }[]` |
+| `tags` | `{ id, name }[]` |
+| `aiAgents` | `{ id, name }[]` |
+| `sequences` | `{ id, name }[]` |
+| `flows` | `{ id, name }[]` |
+| `flowSpec` | Static reference data: `stepTypes` (derived from the DSL schema, see above), `waitUnits`, `channels` |
+
+If a single loader fails (e.g. a malformed row), it is **omitted from the
+response** rather than failing the whole call — `capabilities.get` runs its loaders
+with `Promise.allSettled`, not `Promise.all`, and logs the failure server-side. A
+missing key in the response can mean either "you didn't ask for it" or "that loader
+failed"; there is no separate error signal per key today.
+
+### Truncation
+
+Every list this endpoint returns is capped at `CAPABILITIES_LIST_LIMIT` (200) —
+this response is fed straight into an LLM's context window, so an unbounded list
+(a workspace with thousands of tags) must never blow it up. **This cap is real and
+enforced**: `inboxes`, `customFields`, `botFields`, `aiAgents`, `sequences`, and
+`flows` all pass an explicit, stable `sort` (`id asc`) alongside the limit, so which
+N rows you get back on a larger table is deterministic across calls. `tags` and
+`templates` fetch the whole table and slice in memory (a known, tracked follow-up —
+see the comments in `capabilities/service.ts`), so they are unbounded database
+reads today even though the *response* is still capped at 200.
+
+If your workspace has more than 200 of something, page through that resource's own
+list endpoint instead (`tags.list`, `customFields.list`, `flows.list`, ...) —
+`capabilities.get` is a discovery aid, not a paginated list API.
+
+**This cap does not apply to what the flow-spec compiler itself sees.** The DSL
+compiler's `FlowAuthoringContext` (`templatesByName`/`customFieldsByName`/
+`flowsByName`/`pipelinesByReferenceName`, built by
+[`getFlowAuthoringContext`](../packages/business/src/capabilities/service.ts))
+fetches templates, custom fields, and flows **unbounded** (and every pipeline with its stages and fields in three batched queries, uncached) — independent of, and via
+different loaders than, the public `capabilities.get` response. This means: a
+`flows.publish`/`flows.updateDraft`/`flows.validate` call with a spec that
+references (by name) the 250th flow, template, or custom field in a workspace with
+more than 200 will still resolve it correctly, even though `capabilities.get`
+itself would have truncated that same entity out of its `flows`/`templates`/
+`customFields` list. In other words: use `capabilities.get` to discover names for
+authoring, but don't assume "not in the capabilities response" means "the compiler
+won't accept it."
+
+WhatsApp templates are unique per `name` + `language`, but the DSL's
+`sendTemplate.templateName` has no language field to disambiguate. When two
+language variants share a name, `getFlowAuthoringContext` deterministically prefers
+the `APPROVED` variant (the only one the compiler would actually accept) over
+whichever one happens to appear last in the underlying list.

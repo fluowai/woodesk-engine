@@ -1,0 +1,23 @@
+/**
+ * Narrows an untrusted webhook field to a non-empty string.
+ *
+ * Meta omits optional fields rather than sending them empty, but it also sends
+ * `""` for some, and both mean "absent" to every caller here. Shared so the
+ * referral parser and the reply readers agree on what counts as a value.
+ */
+export const asString = (value: unknown): string | null =>
+  typeof value === "string" && value.length > 0 ? value : null
+
+/** Narrows an untrusted value to a plain object (not null, not an array). */
+export const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+
+/** Reads the top-level entries from an untrusted Meta webhook body. */
+export const readWebhookEntries = (rawBody: unknown): unknown[] => {
+  if (typeof rawBody !== "object" || rawBody === null) {
+    return []
+  }
+
+  const entries = (rawBody as { entry?: unknown }).entry
+  return Array.isArray(entries) ? entries : []
+}

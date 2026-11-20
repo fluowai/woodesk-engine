@@ -1,0 +1,817 @@
+import { type DatabaseClient, db, eq } from "@chatbotx.io/database/client"
+import {
+  isExternalStoreSource,
+  type ProductStatus,
+} from "@chatbotx.io/database/partials"
+import {
+  discountCodeRepository,
+  type ProductImportInsert,
+  productCategoryRepository,
+  productRepository,
+} from "@chatbotx.io/database/repositories"
+import {
+  productAddonModel,
+  productVariantModel,
+  productVariantOptionModel,
+} from "@chatbotx.io/database/schema"
+import type {
+  ProductAddonModel,
+  ProductModel,
+  ProductVariantModel,
+  ProductVariantOptionModel,
+} from "@chatbotx.io/database/types"
+import { createId } from "@chatbotx.io/utils"
+import { BaseService } from "../base.service"
+import { resolveStoreSource } from "../ecommerce-settings/store-source"
+import { notFoundException } from "../errors"
+import { externalStoreManagedException } from "../external-store/errors"
+import {
+  assertResourceEditable,
+  changedKeysOf,
+  changedStoredContentKeys,
+  isTemplateInstalled,
+  withDeleteGuard,
+} from "../template/installed-resource.service"
+import { TEMPLATE_LOCKED_CONTENT_KEYS } from "../template/lock-policy"
+import {
+  type TemplateLockKey,
+  withTemplateLockedTransaction,
+} from "../template/template-resource-locks"
+import { vendorService } from "../vendor/service"
+
+export type ProductImageInput = {
+  id?: string
+  mode: "link" | "file"
+  url: string
+}
+
+export type ProductWriteData = {
+  workspaceId: string
+  name: string
+  shortDescription?: string | null
+  longDescription?: string | null
+  price?: number
+  taxes?: number
+  discount?: number
+  sku?: string | null
+  inventoryPolicy?: "dont_track" | "track"
+  inventoryQuantity?: number
+  allowOutOfStockPurchase?: boolean
+  images?: ProductImageInput[]
+  tags?: string[]
+  /** Picks an existing vendor. Wins over `vendor` when both are given. */
+  vendorId?: string | null
+  /**
+   * Names the vendor instead of picking one; a name not seen before creates
+   * the vendor. Kept so the product API, imports and templates — which all
+   * carry a vendor name — keep working.
+   */
+  vendor?: string | null
+  rank?: number
+  categoryId?: string | null
+  subcategoryId?: string | null
+  status?: ProductStatus
+  isSearchable?: boolean
+  allowSpecialRequest?: boolean
+  isAddonOnly?: boolean
+}
+
+export type ProductVariantOptionInput = {
+  name: string
+  values: string[]
+  position: number
+}
+
+export type ProductVariantInput = {
+  combination: Record<string, string>
+  price: number
+  isEnabled: boolean
+}
+
+export type ProductAddonInput = {
+  name: string
+  maxSelections: number
+  addonProductIds: string[]
+}
+
+export type ProductFullWriteData = ProductWriteData & {
+  variantOptions: ProductVariantOptionInput[]
+  variants: ProductVariantInput[]
+  addons: ProductAddonInput[]
+}
+
+/** The form calls it `mode`; the column stores it as `type`. */
+const toImageRows = (images: ProductImageInput[]) =>
+  images.map(({ mode, url }) => ({ type: mode, url }))
+
+/** The categories and addon products a write points at: parents locked with the product. */
+const productParents = (
+  data: { categoryId?: string | null; subcategoryId?: string | null },
+  addons: readonly ProductAddonInput[] = [],
+): TemplateLockKey[] => [
+  ...[data.categoryId, data.subcategoryId].flatMap((resourceId) =>
+    resourceId ? [{ kind: "productCategory" as const, resourceId }] : [],
+  ),
+  ...[...new Set(addons.flatMap((addon) => addon.addonProductIds))].map(
+    (resourceId) => ({ kind: "product" as const, resourceId }),
+  ),
+]
+
+class ProductService extends BaseService {
+  private async assertReferencesBelongToWorkspace(input: {
+    workspaceId: string
+    categoryId?: string | null
+    subcategoryId?: string | null
+    /**
+     * The category the sub-category has to sit under. Only a partial update
+     * that names a sub-category without repeating its category needs this;
+     * everywhere else the incoming `categoryId` is the answer.
+     */
+    expectedParentId?: string | null
+    addons?: ProductAddonInput[]
+    tx: DatabaseClient
+  }): Promise<void> {
+    if (input.categoryId) {
+      const category = await productCategoryRepository.find(
+        {
+          workspaceId: input.workspaceId,
+          categoryId: input.categoryId,
+        },
+        input.tx,
+      )
+      if (!category) {
+        throw notFoundException("Product category does not exist.")
+      }
+    }
+
+    if (input.subcategoryId) {
+      const subcategory = await productCategoryRepository.find(
+        {
+          workspaceId: input.workspaceId,
+          categoryId: input.subcategoryId,
+        },
+        input.tx,
+      )
+      // Checking the parentage here, not just existence: a sub-category that
+      // belongs to a different category would silently break the filter, which
+      // reaches products through whichever of the two columns matches.
+      if (!subcategory) {
+        throw notFoundException("Product sub-category does not exist.")
+      }
+      const expectedParentId =
+        input.expectedParentId === undefined
+          ? (input.categoryId ?? null)
+          : input.expectedParentId
+      if (subcategory.parentId !== expectedParentId) {
+        throw notFoundException(
+          "Product sub-category does not belong to the selected category.",
+        )
+      }
+    }
+
+    const addonProductIds = Array.from(
+      new Set((input.addons ?? []).flatMap((addon) => addon.addonProductIds)),
+    )
+    if (addonProductIds.length === 0) {
+      return
+    }
+    const addonProducts = await productRepository.findByIds(
+      {
+        workspaceId: input.workspaceId,
+        productIds: addonProductIds,
+      },
+      input.tx,
+    )
+    if (addonProducts.length !== addonProductIds.length) {
+      throw notFoundException("One or more addon products do not exist.")
+    }
+  }
+
+  /**
+   * Changing the category without naming a sub-category would leave the stored
+   * sub-category under the old category. Drop it unless it already sits under
+   * the new category.
+   */
+  private async withConsistentSubcategory<
+    Data extends { categoryId?: string | null; subcategoryId?: string | null },
+  >(input: {
+    productId: string
+    workspaceId: string
+    data: Data
+    tx: DatabaseClient
+  }): Promise<Data> {
+    const { data } = input
+    if (data.categoryId === undefined || data.subcategoryId !== undefined) {
+      return data
+    }
+    const current = await productRepository.find(
+      { workspaceId: input.workspaceId, productId: input.productId },
+      input.tx,
+    )
+    if (!current?.subcategoryId || current.categoryId === data.categoryId) {
+      return data
+    }
+    if (data.categoryId) {
+      const subcategory = await productCategoryRepository.find(
+        {
+          workspaceId: input.workspaceId,
+          categoryId: current.subcategoryId,
+        },
+        input.tx,
+      )
+      if (subcategory?.parentId === data.categoryId) {
+        return data
+      }
+    }
+    return { ...data, subcategoryId: null }
+  }
+
+  /**
+   * A patch may name a sub-category without repeating the category it sits
+   * under. Checking that against `null` would reject a pair that is in fact
+   * valid, so the category the product already has stands in for the absent
+   * one. `undefined` means the patch answers the question by itself.
+   */
+  private async resolveExpectedParentId(input: {
+    productId: string
+    workspaceId: string
+    data: Partial<ProductWriteData>
+    tx: DatabaseClient
+  }): Promise<string | null | undefined> {
+    if (input.data.categoryId !== undefined || !input.data.subcategoryId) {
+      return
+    }
+    const current = await productRepository.find(
+      { workspaceId: input.workspaceId, productId: input.productId },
+      input.tx,
+    )
+    return current?.categoryId ?? null
+  }
+
+  /**
+   * The `vendorId` column a write should set: `undefined` leaves it alone,
+   * `null` clears it. A vendor named by `vendor` is created when missing.
+   */
+  private async resolveVendorId(input: {
+    workspaceId: string
+    data: Pick<ProductWriteData, "vendor" | "vendorId">
+    tx: DatabaseClient
+  }): Promise<string | null | undefined> {
+    const { workspaceId, data, tx } = input
+    if (data.vendorId !== undefined) {
+      if (data.vendorId) {
+        await vendorService.assertBelongsToWorkspace({
+          workspaceId,
+          vendorId: data.vendorId,
+          tx,
+        })
+      }
+      return data.vendorId
+    }
+    if (data.vendor !== undefined) {
+      return await vendorService.resolveName({
+        workspaceId,
+        name: data.vendor,
+        tx,
+      })
+    }
+    return
+  }
+
+  private async insert(
+    data: ProductWriteData,
+    tx: DatabaseClient,
+  ): Promise<ProductModel> {
+    const { images = [], vendor, vendorId, ...productData } = data
+    const resolvedVendorId = await this.resolveVendorId({
+      workspaceId: data.workspaceId,
+      data: { vendor, vendorId },
+      tx,
+    })
+    const product = await productRepository.create(
+      {
+        ...productData,
+        vendorId: resolvedVendorId ?? null,
+        images: toImageRows(images),
+      },
+      tx,
+    )
+    if (!product) {
+      throw new Error("Failed to create product")
+    }
+    return product
+  }
+
+  /**
+   * The template edit guard for a partial write: a no-op unless the patch can
+   * touch locked content. Must run on a locked transaction and BEFORE the
+   * reads/writes it protects, so a sync/restore/uninstall cannot race it.
+   */
+  private async assertPatchEditable(input: {
+    productId: string
+    workspaceId: string
+    data: Partial<Omit<ProductWriteData, "workspaceId">>
+    tx: DatabaseClient
+  }): Promise<void> {
+    if (
+      !Object.keys(input.data).some((key) =>
+        TEMPLATE_LOCKED_CONTENT_KEYS.product.includes(
+          key === "vendor" ? "vendorId" : key,
+        ),
+      )
+    ) {
+      return
+    }
+    // Only a patch that can touch locked content needs the stored row.
+    const existing = await productRepository.find(
+      { workspaceId: input.workspaceId, productId: input.productId },
+      input.tx,
+    )
+    // Guard what actually changes, not what the form submitted: an
+    // unchanged full-form save of a locked product is allowed. `vendor` and
+    // `images` are written in another shape than stored, so they count as
+    // changed whenever present.
+    const { vendor: _vendor, images: _images, ...comparable } = input.data
+    await assertResourceEditable({
+      workspaceId: input.workspaceId,
+      resourceKind: "product",
+      resourceIds: [input.productId],
+      changedKeys: [
+        ...(existing
+          ? changedKeysOf(existing, comparable)
+          : Object.keys(comparable)),
+        ...(input.data.vendor === undefined ? [] : ["vendorId"]),
+        ...(input.data.images === undefined ? [] : ["images"]),
+      ],
+      referencedParents: productParents(input.data),
+      tx: input.tx,
+    })
+  }
+
+  private async applyPatch(input: {
+    productId: string
+    workspaceId: string
+    data: Partial<Omit<ProductWriteData, "workspaceId">>
+    tx: DatabaseClient
+    /** The caller already ran the template edit guard for this write. */
+    guarded?: boolean
+  }): Promise<void> {
+    const { images, vendor, vendorId, ...productData } = input.data
+    if (!input.guarded) {
+      await this.assertPatchEditable(input)
+    }
+    const resolvedVendorId = await this.resolveVendorId({
+      workspaceId: input.workspaceId,
+      data: { vendor, vendorId },
+      tx: input.tx,
+    })
+    const updated = await productRepository.update(
+      {
+        workspaceId: input.workspaceId,
+        productId: input.productId,
+        // Absent images mean "leave them alone", not "clear them".
+        values: {
+          ...productData,
+          ...(resolvedVendorId === undefined
+            ? {}
+            : { vendorId: resolvedVendorId }),
+          ...(images ? { images: toImageRows(images) } : {}),
+        },
+      },
+      input.tx,
+    )
+    if (!updated) {
+      throw notFoundException("Product does not exist.")
+    }
+  }
+
+  async create(props: {
+    data: ProductWriteData
+    tx?: DatabaseClient
+  }): Promise<ProductModel> {
+    const { data, tx = db } = props
+    await this.assertReferencesBelongToWorkspace({
+      workspaceId: data.workspaceId,
+      categoryId: data.categoryId,
+      subcategoryId: data.subcategoryId,
+      tx,
+    })
+    return await this.insert(data, tx)
+  }
+
+  /**
+   * A store mirroring Shopify adds products in Shopify, and a mirrored
+   * product is edited there — its status included, which follows Shopify's.
+   */
+  private async assertManagedHere(input: {
+    workspaceId: string
+    productIds?: string[]
+    tx?: DatabaseClient
+  }) {
+    if (!input.productIds) {
+      const storeSource = await resolveStoreSource(input.workspaceId)
+      if (isExternalStoreSource(storeSource)) {
+        throw externalStoreManagedException(storeSource)
+      }
+      return
+    }
+    const rows = await productRepository.findByIds(
+      { workspaceId: input.workspaceId, productIds: input.productIds },
+      input.tx,
+    )
+    const mirrored = rows.find((row) => isExternalStoreSource(row.source))
+    if (mirrored && isExternalStoreSource(mirrored.source)) {
+      throw externalStoreManagedException(mirrored.source)
+    }
+  }
+
+  async createFull(data: ProductFullWriteData): Promise<ProductModel> {
+    await this.assertManagedHere({ workspaceId: data.workspaceId })
+    const { variantOptions, variants, addons, ...productData } = data
+    return await db.transaction(async (tx) => {
+      // One guard covering categories and addons together, so the row is never
+      // inserted before every reference is known to live in this workspace.
+      await this.assertReferencesBelongToWorkspace({
+        workspaceId: data.workspaceId,
+        categoryId: data.categoryId,
+        subcategoryId: data.subcategoryId,
+        addons,
+        tx,
+      })
+      const product = await this.insert(productData, tx)
+      await Promise.all([
+        productVariantOptionService.createBulk({
+          productId: product.id,
+          options: variantOptions,
+          tx,
+        }),
+        productVariantService.createBulk({
+          productId: product.id,
+          variants,
+          tx,
+        }),
+        productAddonService.createBulk({
+          productId: product.id,
+          addons,
+          tx,
+        }),
+      ])
+      return product
+    })
+  }
+
+  async update(props: {
+    productId: string
+    workspaceId: string
+    data: Partial<Omit<ProductWriteData, "workspaceId">>
+    tx?: DatabaseClient
+  }): Promise<void> {
+    const { productId, workspaceId } = props
+    const run = async (tx: DatabaseClient) => {
+      await this.assertManagedHere({
+        workspaceId,
+        productIds: [productId],
+        tx,
+      })
+      // Then the template guard, before any other read of the product.
+      await this.assertPatchEditable({
+        productId,
+        workspaceId,
+        data: props.data,
+        tx,
+      })
+      const data = await this.withConsistentSubcategory({
+        productId,
+        workspaceId,
+        data: props.data,
+        tx,
+      })
+      await this.assertReferencesBelongToWorkspace({
+        workspaceId,
+        categoryId: data.categoryId,
+        subcategoryId: data.subcategoryId,
+        expectedParentId: await this.resolveExpectedParentId({
+          productId,
+          workspaceId,
+          data,
+          tx,
+        }),
+        tx,
+      })
+      await this.applyPatch({
+        productId,
+        workspaceId,
+        data,
+        tx,
+        guarded: true,
+      })
+    }
+    // A caller-supplied transaction holds its own locks; otherwise open the
+    // locked one here (a bare `db` would release the advisory lock at once).
+    if (props.tx) {
+      await run(props.tx)
+      return
+    }
+    // The product and the categories/addons the patch points at are locked
+    // before `assertPatchEditable` reads the stored row, so the diff behind the
+    // guard is computed under the lock.
+    await withTemplateLockedTransaction(run, {
+      workspaceId: props.workspaceId,
+      initialKeys: [
+        { kind: "product", resourceId: productId },
+        ...productParents(props.data),
+      ],
+    })
+  }
+
+  async updateFull(
+    input: Omit<ProductFullWriteData, "workspaceId"> & {
+      workspaceId: string
+      productId: string
+    },
+  ): Promise<void> {
+    const {
+      productId,
+      workspaceId,
+      variantOptions,
+      variants,
+      addons,
+      ...patch
+    } = input
+    await this.assertManagedHere({ workspaceId, productIds: [productId] })
+    await withTemplateLockedTransaction(async (tx) => {
+      // First step: the locks, tombstone and parent checks. Variants, options
+      // and addons are rewritten on every full save, so whether locked content
+      // changed is decided after the write, stored rows against stored rows:
+      // a locked product whose installer only changed rank or stock saves.
+      const referencedParents = productParents(patch, addons)
+      await assertResourceEditable({
+        workspaceId,
+        resourceKind: "product",
+        resourceIds: [productId],
+        changedKeys: [],
+        referencedParents,
+        tx,
+      })
+      // The stored before/after reads only feed the locked-content diff, which
+      // only an installed copy has; a plain product skips both reads and the
+      // second guard pass (the guard above already resolved this in memory).
+      const installed = await isTemplateInstalled({
+        workspaceId,
+        resourceKind: "product",
+        resourceIds: [productId],
+        tx,
+      })
+      const before = installed
+        ? await productRepository.findDetail({ id: productId, workspaceId }, tx)
+        : undefined
+      const data = await this.withConsistentSubcategory({
+        productId,
+        workspaceId,
+        data: patch,
+        tx,
+      })
+      await this.assertReferencesBelongToWorkspace({
+        workspaceId,
+        categoryId: data.categoryId,
+        subcategoryId: data.subcategoryId,
+        expectedParentId: await this.resolveExpectedParentId({
+          productId,
+          workspaceId,
+          data,
+          tx,
+        }),
+        addons,
+        tx,
+      })
+      await this.applyPatch({
+        productId,
+        workspaceId,
+        data,
+        tx,
+        guarded: true,
+      })
+      await Promise.all([
+        productVariantOptionService.deleteByProductId({ productId, tx }),
+        productVariantService.deleteByProductId({ productId, tx }),
+        productAddonService.deleteByProductId({ productId, tx }),
+      ])
+      await Promise.all([
+        productVariantOptionService.createBulk({
+          productId,
+          options: variantOptions,
+          tx,
+        }),
+        productVariantService.createBulk({ productId, variants, tx }),
+        productAddonService.createBulk({ productId, addons, tx }),
+      ])
+      const after = installed
+        ? await productRepository.findDetail({ id: productId, workspaceId }, tx)
+        : undefined
+      if (before && after) {
+        await assertResourceEditable({
+          workspaceId,
+          resourceKind: "product",
+          resourceIds: [productId],
+          changedKeys: changedStoredContentKeys({
+            resourceKind: "product",
+            before,
+            after,
+            parentKeys: ["productId"],
+            keyMap: { options: "variantOptions" },
+          }),
+          referencedParents,
+          tx,
+        })
+      }
+    })
+  }
+
+  async delete(input: {
+    ids: string[]
+    workspaceId: string
+    tx?: DatabaseClient
+  }): Promise<void> {
+    const { ids, workspaceId } = input
+    await this.assertManagedHere({ workspaceId, productIds: ids, tx: input.tx })
+    await withDeleteGuard(
+      {
+        workspaceId,
+        targets: [{ resourceKind: "product", resourceIds: ids }],
+        tx: input.tx,
+      },
+      async (tx) => {
+        await this.deleteInTx(tx, { workspaceId, ids })
+      },
+    )
+  }
+
+  /**
+   * The delete core, shared with the template uninstall so there is one
+   * implementation. Discount codes keep product ids in a JSON list with no
+   * foreign key, so the deleted ids have to be taken out here or the code can
+   * never be edited again. Returns the ids actually deleted.
+   */
+  async deleteInTx(
+    tx: DatabaseClient,
+    input: { workspaceId: string; ids: string[] },
+  ): Promise<string[]> {
+    await discountCodeRepository.removeProductIds(
+      { workspaceId: input.workspaceId, productIds: input.ids },
+      tx,
+    )
+    const rows = await productRepository.deleteByIds(
+      { workspaceId: input.workspaceId, productIds: input.ids },
+      tx,
+    )
+    return rows.map((row) => String(row.id))
+  }
+
+  async list(input: Parameters<typeof productRepository.list>[0]) {
+    return await productRepository.list({
+      ...input,
+      source: input.source ?? (await resolveStoreSource(input.workspaceId)),
+    })
+  }
+
+  async findById(id: string, workspaceId: string) {
+    const product = await productRepository.findDetail({ id, workspaceId })
+    if (!product) {
+      throw notFoundException("Product does not exist.")
+    }
+    return product
+  }
+
+  async listFormOptions(workspaceId: string) {
+    return await productRepository.listFormOptions({
+      workspaceId,
+      source: await resolveStoreSource(workspaceId),
+    })
+  }
+
+  /** Rows from a file import. Vendors are named, and created when missing. */
+  async createFromImport(input: {
+    workspaceId: string
+    products: Array<
+      Omit<ProductImportInsert, "vendorId"> & { vendor?: string | null }
+    >
+  }) {
+    await this.assertManagedHere({ workspaceId: input.workspaceId })
+    return await db.transaction(async (tx) => {
+      const vendorIds = await vendorService.resolveByNames({
+        workspaceId: input.workspaceId,
+        names: input.products.flatMap((product) => product.vendor ?? []),
+        createMissing: true,
+        tx,
+      })
+      return await productRepository.createFromImport(
+        {
+          workspaceId: input.workspaceId,
+          products: input.products.map(({ vendor, ...product }) => ({
+            ...product,
+            vendorId: vendor
+              ? (vendorIds.get(vendor.trim().toLowerCase()) ?? null)
+              : null,
+          })),
+        },
+        tx,
+      )
+    })
+  }
+
+  async listForCatalogSync(
+    input: Parameters<typeof productRepository.listForCatalogSync>[0],
+  ) {
+    return await productRepository.listForCatalogSync(input)
+  }
+}
+
+class ProductVariantOptionService extends BaseService {
+  async createBulk(input: {
+    productId: string
+    options: ProductVariantOptionInput[]
+    tx?: DatabaseClient
+  }): Promise<ProductVariantOptionModel[]> {
+    const { productId, options, tx = db } = input
+    if (options.length === 0) {
+      return []
+    }
+    return await tx
+      .insert(productVariantOptionModel)
+      .values(
+        options.map((option) => ({ id: createId(), productId, ...option })),
+      )
+      .returning()
+  }
+
+  async deleteByProductId(input: {
+    productId: string
+    tx?: DatabaseClient
+  }): Promise<void> {
+    const { productId, tx = db } = input
+    await tx
+      .delete(productVariantOptionModel)
+      .where(eq(productVariantOptionModel.productId, productId))
+  }
+}
+
+class ProductVariantService extends BaseService {
+  async createBulk(input: {
+    productId: string
+    variants: ProductVariantInput[]
+    tx?: DatabaseClient
+  }): Promise<ProductVariantModel[]> {
+    const { productId, variants, tx = db } = input
+    if (variants.length === 0) {
+      return []
+    }
+    return await tx
+      .insert(productVariantModel)
+      .values(
+        variants.map((variant) => ({ id: createId(), productId, ...variant })),
+      )
+      .returning()
+  }
+
+  async deleteByProductId(input: {
+    productId: string
+    tx?: DatabaseClient
+  }): Promise<void> {
+    const { productId, tx = db } = input
+    await tx
+      .delete(productVariantModel)
+      .where(eq(productVariantModel.productId, productId))
+  }
+}
+
+class ProductAddonService extends BaseService {
+  async createBulk(input: {
+    productId: string
+    addons: ProductAddonInput[]
+    tx?: DatabaseClient
+  }): Promise<ProductAddonModel[]> {
+    const { productId, addons, tx = db } = input
+    if (addons.length === 0) {
+      return []
+    }
+    return await tx
+      .insert(productAddonModel)
+      .values(addons.map((addon) => ({ id: createId(), productId, ...addon })))
+      .returning()
+  }
+
+  async deleteByProductId(input: {
+    productId: string
+    tx?: DatabaseClient
+  }): Promise<void> {
+    const { productId, tx = db } = input
+    await tx
+      .delete(productAddonModel)
+      .where(eq(productAddonModel.productId, productId))
+  }
+}
+
+export const productService = new ProductService()
+export const productVariantOptionService = new ProductVariantOptionService()
+export const productVariantService = new ProductVariantService()
+export const productAddonService = new ProductAddonService()

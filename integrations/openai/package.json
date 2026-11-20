@@ -1,0 +1,29 @@
+{
+  "name": "@chatbotx.io/integration-openai",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@ai-sdk/openai": "catalog:",
+    "@chatbotx.io/sdk": "workspace:*",
+    "ai": "catalog:"
+  },
+  "devDependencies": {
+    "@chatbotx.io/typescript-config": "workspace:*",
+    "@chatbotx.io/vitest-config": "workspace:*",
+    "@types/node": "catalog:",
+    "msw": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./**/*": "./src/**/*.ts",
+    "./test-handlers": "./src/test-handlers.ts"
+  },
+  "scripts": {
+    "check-types": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
+  }
+}

@@ -1,0 +1,204 @@
+# ==============================================================================
+# Woodesk Automation Engine - Production Docker Compose (d:\woodesk-engine)
+# ==============================================================================
+
+version: '3.8'
+
+services:
+  postgres:
+    image: timescale/timescaledb-ha:pg18-all
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - db-data:/home/postgres/pgdata
+    command: ["postgres", "-c", "log_statement=${POSTGRES_LOG_STATEMENT:-none}"]
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-chatbotx}
+      - POSTGRES_USER=${POSTGRES_USER:-chatbotx}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-secretkey}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - engine-network
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    volumes:
+      - cache-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - engine-network
+
+  filesystem:
+    image: rustfs/rustfs:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-chatbotx}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-secretkey}
+      RUSTFS_API_CORS_ALLOW_ORIGIN: "*"
+    volumes:
+      - filesystem-data:/data
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -f http://127.0.0.1:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - engine-network
+
+  filesystem-init:
+    image: rustfs/rc:latest
+    depends_on:
+      filesystem:
+        condition: service_healthy
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-chatbotx}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-secretkey}
+    entrypoint: >
+      /bin/sh -c "rc alias set local http://filesystem:9000
+      $${RUSTFS_ACCESS_KEY} $${RUSTFS_SECRET_KEY}; rc mb local/chatbotx
+      --ignore-existing; touch /tmp/empty && rc cp /tmp/empty
+      local/chatbotx/public/; rc anonymous set public local/chatbotx/public;"
+    networks:
+      - engine-network
+
+  javascript-executor:
+    build:
+      context: .
+      dockerfile: apps/javascript-executor/docker/Dockerfile
+    restart: unless-stopped
+    environment:
+      JAVASCRIPT_EXECUTOR_TOKEN: ${JAVASCRIPT_EXECUTOR_TOKEN:-woodesk-sandbox-secure-token-32chars}
+      MAX_CONCURRENCY: 4
+    networks:
+      - engine-network
+      - sandbox-network
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3210/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  builder:
+    build:
+      context: .
+      dockerfile: apps/builder/docker/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3123:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      filesystem:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    environment:
+      - NODE_ENV=production
+      - RUN_DB_MIGRATE=true
+      - RUN_DB_SEED=true
+      - NEXT_PUBLIC_EDITION=enterprise
+      - LICENSE_REFRESH_ENABLED=false
+      - LICENSE_KEY=woodesk-unlocked-master-token
+      - NEXT_PUBLIC_BRAND_NAME=Woodesk Automation Engine
+      - NEXT_PUBLIC_BRAND_SHORT=Woodesk
+      - NEXT_PUBLIC_BRAND_ORG=Wootech
+      - DATABASE_URL=postgresql://chatbotx:secretkey@postgres:5432/chatbotx?schema=public
+      - REDIS_URL=redis://redis:6379
+      - JAVASCRIPT_EXECUTOR_URL=http://javascript-executor:3210
+      - JAVASCRIPT_EXECUTOR_TOKEN=${JAVASCRIPT_EXECUTOR_TOKEN:-woodesk-sandbox-secure-token-32chars}
+      - BETTER_AUTH_SECRET=${BETTER_AUTH_SECRET:-VLu1KcS63DTTnZU3Dh/ykI9Ld26YQXy/1IMJdZf/kHI=}
+      - BETTER_AUTH_URL=${BETTER_AUTH_URL:-http://localhost:3123}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-16fca8032c77c99a42197a57bce0cf1275c110ab1385f8eb6942665ed317a973}
+      - S3_ENDPOINT=http://filesystem:9000
+      - S3_REGION=us-east-1
+      - S3_ACCESS_KEY_ID=chatbotx
+      - S3_SECRET_ACCESS_KEY=secretkey
+      - S3_BUCKET_NAME=chatbotx
+      - S3_PUBLIC_BASE_URL=http://localhost:9000/chatbotx
+    networks:
+      - engine-network
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/worker/docker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      filesystem:
+        condition: service_healthy
+      javascript-executor:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_EDITION=enterprise
+      - LICENSE_REFRESH_ENABLED=false
+      - DATABASE_URL=postgresql://chatbotx:secretkey@postgres:5432/chatbotx?schema=public
+      - REDIS_URL=redis://redis:6379
+      - JAVASCRIPT_EXECUTOR_URL=http://javascript-executor:3210
+      - JAVASCRIPT_EXECUTOR_TOKEN=${JAVASCRIPT_EXECUTOR_TOKEN:-woodesk-sandbox-secure-token-32chars}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-16fca8032c77c99a42197a57bce0cf1275c110ab1385f8eb6942665ed317a973}
+    networks:
+      - engine-network
+      - sandbox-network
+
+  realtime:
+    build:
+      context: .
+      dockerfile: apps/realtime/docker/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "1999:1999"
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - NEXT_PUBLIC_BUILDER_URL=http://builder:3000
+      - REALTIME_BUILDER_URL=http://builder:3000
+    networks:
+      - engine-network
+
+networks:
+  engine-network:
+    driver: bridge
+  sandbox-network:
+    driver: bridge
+    internal: true
+
+volumes:
+  db-data:
+  cache-data:
+  filesystem-data:

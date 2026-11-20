@@ -1,0 +1,265 @@
+import {
+  contactCustomFieldService,
+  customFieldService,
+} from "@chatbotx.io/business"
+import { notFoundException } from "@chatbotx.io/business/errors"
+import { zodBigintAsString } from "@chatbotx.io/utils"
+import { fieldOperationByApiName } from "@chatbotx.io/utils/custom-field-operation"
+import { z } from "zod"
+import { mcpSpec } from "@/lib/orpc/mcp-annotations"
+import {
+  possibleErrorsOnDeletingResource,
+  possibleErrorsOnFindingResource,
+  possibleErrorsOnMutatingResource,
+  possibleErrorsOnWritingContactFields,
+} from "@/lib/orpc/orpc-error-helper"
+import { publicContactIdentifier } from "@/lib/public-api/contact-identifier"
+import { ianaTimezoneSchema } from "@/lib/public-api/iana-timezone"
+import { contactIdFor } from "@/lib/public-api/member-scope"
+import { workspaceTokenAuthAPIForScope } from "@/orpc"
+import {
+  findContactCustomField,
+  listContactCustomFields,
+} from "../../lib/list-contact-fields"
+import {
+  listPublicContactCustomFieldsResponse,
+  publicContactCustomFieldResource,
+} from "../../schema/contact-custom-field"
+import { addContactCustomFieldOperationsPublicRequest } from "../../schema/public/custom-fields"
+
+const workspaceTokenAuthAPI = workspaceTokenAuthAPIForScope("contacts")
+
+export const contactsCustomFieldsPublicRouter = {
+  listCustomFields: workspaceTokenAuthAPI
+    .route({
+      method: "GET",
+      path: "/v1/contacts/{identifier}/custom-fields",
+      summary: "Get all custom fields from contact",
+      description:
+        "Use this to inspect every custom-field value for a contact after resolving its identifier with `contacts.get`. Call `contacts.setCustomField` to change one value or `contacts.applyCustomFieldOperations` to change several in one call.",
+      tags: ["Contacts"],
+      spec: mcpSpec({ visibility: "default" }),
+    })
+    .input(
+      z.object({
+        identifier: publicContactIdentifier,
+      }),
+    )
+    .output(listPublicContactCustomFieldsResponse)
+    .errors(possibleErrorsOnFindingResource)
+    .handler(async ({ context, input }) => {
+      const contactId = await contactIdFor(context, input.identifier)
+      return await listContactCustomFields({
+        workspaceId: context.workspace.id,
+        contactId,
+      })
+    }),
+
+  getCustomField: workspaceTokenAuthAPI
+    .route({
+      method: "GET",
+      path: "/v1/contacts/{identifier}/custom-fields/{idOrName}",
+      summary: "Get contact custom field value",
+      description:
+        "Returns one custom field's current value for the contact identified by `identifier`. Returns 404 when the field exists but has no value on this contact. Use `contacts.listCustomFields` to see every field at once.",
+      tags: ["Contacts"],
+    })
+    .input(
+      z.object({
+        identifier: publicContactIdentifier,
+        idOrName: z
+          .string()
+          .min(1)
+          .describe(
+            "Custom field id (numeric string) or field name. Get either from `customFields.list`.",
+          ),
+      }),
+    )
+    .output(publicContactCustomFieldResource)
+    .errors(possibleErrorsOnFindingResource)
+    .handler(async ({ context, input }) => {
+      const workspaceId = context.workspace.id
+      const contactId = await contactIdFor(context, input.identifier)
+      const field = await customFieldService.findByKeyOrFail({
+        workspaceId,
+        key: input.idOrName,
+      })
+      return await findContactCustomField({
+        contactId,
+        customFieldId: field.id,
+        workspaceId,
+      })
+    }),
+
+  setCustomField: workspaceTokenAuthAPI
+    .route({
+      method: "PUT",
+      path: "/v1/contacts/{identifier}/custom-fields/{idOrName}",
+      summary: "Set contact custom field value",
+      description:
+        "Changes one custom-field value on a resolved contact without altering its other fields. Use `contacts.listCustomFields` to inspect current values, or `contacts.applyCustomFieldOperations` for several changes.",
+      successStatus: 204,
+      tags: ["Contacts"],
+      spec: mcpSpec({ visibility: "default" }),
+    })
+    .input(
+      z.object({
+        identifier: publicContactIdentifier,
+        idOrName: z
+          .string()
+          .min(1)
+          .describe(
+            "Custom field id (numeric string) or field name. Get either from `customFields.list`.",
+          ),
+        value: z.string().trim().describe("New value for the custom field."),
+        clientTimezone: ianaTimezoneSchema
+          .optional()
+          .describe(
+            "IANA timezone of the caller, e.g. `Asia/Ho_Chi_Minh`. Anchors a date-only value to that calendar day; defaults to the contact's, then the workspace's zone.",
+          ),
+      }),
+    )
+    .errors(possibleErrorsOnWritingContactFields)
+    .handler(async ({ context, input }) => {
+      const workspaceId = context.workspace.id
+      const contactId = await contactIdFor(context, input.identifier)
+      const field = await customFieldService.findByKeyOrFail({
+        workspaceId,
+        key: input.idOrName,
+      })
+      await contactCustomFieldService.setValueForContact({
+        workspaceId,
+        contactId,
+        customFieldId: field.id,
+        value: input.value,
+        sourceTimezone: input.clientTimezone,
+      })
+    }),
+
+  // Deprecated — use `contacts.setCustomField` instead. Kept for backward
+  // compatibility with the pre-consolidation `POST .../{customFieldId}`
+  // path and method; hidden from MCP/CLI tool listings.
+  setCustomFieldLegacy: workspaceTokenAuthAPI
+    .route({
+      method: "POST",
+      path: "/v1/contacts/{identifier}/custom-fields/{customFieldId}",
+      summary: "Set contact custom field value",
+      description:
+        "Deprecated — `contacts.setCustomField` now covers this at `PUT .../custom-fields/{idOrName}`, addressed by id or name and with `clientTimezone` for date values; this POST route only ever accepted a numeric `customFieldId` and has no timezone input.",
+      successStatus: 204,
+      deprecated: true,
+      tags: ["Contacts"],
+    })
+    .input(
+      z.object({
+        identifier: publicContactIdentifier,
+        customFieldId: zodBigintAsString().describe(
+          "Custom field id (numeric string). Get it from `customFields.list`.",
+        ),
+        value: z.string().trim().describe("New value for the custom field."),
+      }),
+    )
+    .errors(possibleErrorsOnMutatingResource)
+    .handler(async ({ context, input }) => {
+      const contactId = await contactIdFor(context, input.identifier)
+      await contactCustomFieldService.setValueForContact({
+        workspaceId: context.workspace.id,
+        contactId,
+        customFieldId: input.customFieldId,
+        value: input.value,
+      })
+    }),
+
+  applyCustomFieldOperations: workspaceTokenAuthAPI
+    .route({
+      method: "PATCH",
+      path: "/v1/contacts/{identifier}/custom-fields",
+      summary: "Apply operations to contact custom fields",
+      description:
+        'Applies a batch of operations to one or more custom fields on the contact, in the given order, each addressed by id or name, all-or-nothing. Text fields support `set`/`append`/`prepend`/`clear`; number fields `set`/`increase`/`decrease`/`formula`/`clear`; date and datetime fields `set`/`setNow`/`dateExpression`/`addMinutes`/`addHours`/`addDays`/`clear`; every other type `set`/`clear`. An empty field counts as `0` for numbers and as "now" for date arithmetic. An operation the field type does not support, or an invalid operand, fails the whole request with `invalidFieldOperation` and the reason. This is the batch equivalent of `contacts.setCustomField` for changing several fields in one call. Example: `{"operations":[{"customFieldId":"123","operation":"increase","value":"1"}]}` to increment a numeric field.',
+      successStatus: 204,
+      tags: ["Contacts"],
+    })
+    .input(addContactCustomFieldOperationsPublicRequest)
+    .errors(possibleErrorsOnWritingContactFields)
+    .handler(async ({ context, input }) => {
+      const workspaceId = context.workspace.id
+      const contactId = await contactIdFor(context, input.identifier)
+
+      // One batched lookup for every referenced field; a field deleted
+      // between this lookup and the write still fails inside the write's
+      // transaction and rolls it back.
+      const fields = await customFieldService.findManyByKeys({
+        workspaceId,
+        keys: input.operations.map((op) => op.customFieldId),
+      })
+      const operations = input.operations.map((op) => {
+        const field = fields.get(op.customFieldId)
+        const operation = fieldOperationByApiName(op.operation)
+        if (!(field && operation)) {
+          throw notFoundException("Custom field not found")
+        }
+        return { customFieldId: field.id, operation, value: op.value }
+      })
+
+      await contactCustomFieldService.applyOperations({
+        workspaceId,
+        contactId,
+        operations,
+        sourceTimezone: input.clientTimezone,
+      })
+    }),
+
+  clearCustomField: workspaceTokenAuthAPI
+    .route({
+      method: "DELETE",
+      path: "/v1/contacts/{identifier}/custom-fields/{idOrName}",
+      summary: "Delete contact custom field",
+      description:
+        "Removes one custom-field value from the contact identified by `identifier`, matched by id or field name. Use `contacts.clearCustomFields` to clear every field at once.",
+      successStatus: 204,
+      tags: ["Contacts"],
+    })
+    .input(
+      z.object({
+        identifier: publicContactIdentifier,
+        idOrName: z
+          .string()
+          .min(1)
+          .describe("Custom field id (numeric string) or exact field name."),
+      }),
+    )
+    .errors(possibleErrorsOnDeletingResource)
+    .handler(async ({ context, input }) => {
+      const contactId = await contactIdFor(context, input.identifier)
+      await contactCustomFieldService.deleteByKey({
+        workspaceId: context.workspace.id,
+        contactId,
+        keyword: input.idOrName,
+      })
+    }),
+
+  clearCustomFields: workspaceTokenAuthAPI
+    .route({
+      method: "DELETE",
+      path: "/v1/contacts/{identifier}/custom-fields",
+      summary: "Clear all custom fields from contact",
+      description:
+        "Removes every custom-field value from the contact identified by `identifier`. Use `contacts.clearCustomField` to remove just one.",
+      successStatus: 204,
+      tags: ["Contacts"],
+    })
+    .input(
+      z.object({
+        identifier: publicContactIdentifier,
+      }),
+    )
+    .errors(possibleErrorsOnDeletingResource)
+    .handler(async ({ context, input }) => {
+      const contactId = await contactIdFor(context, input.identifier)
+      await contactCustomFieldService.clearByContactId({
+        workspaceId: context.workspace.id,
+        contactId,
+      })
+    }),
+}

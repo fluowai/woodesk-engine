@@ -1,0 +1,161 @@
+import { aiTimeouts, isImageUrl, processStreamingText } from "@chatbotx.io/ai"
+import { probeImageMimeType } from "@chatbotx.io/business/media/probe-image-url"
+import { HTTP_URL_RE } from "@chatbotx.io/business/utils"
+import type { AIAnalyzeImageSchema } from "@chatbotx.io/flow-config"
+import { resolveContactVariablesDeep } from "@chatbotx.io/variables"
+import { streamText } from "ai"
+import { normalizeError } from "universal-error-normalizer"
+import { logger } from "../../../lib/logger"
+import {
+  readCustomFieldValue,
+  saveResultToCustomField,
+} from "../../utils/contact"
+import type { ExecuteStepProps } from "../flow"
+import { logStepProviderError } from "../flow-utils"
+import { aiErrorLogProvider } from "../shared/ai-error-log-provider"
+import { buildChannelLengthInstruction } from "../shared/ai-output-length"
+import { resolveFlowAIModel } from "../shared/flow-ai-model-resolver"
+import type { ExecuteStepResult } from "../step"
+
+/**
+ * The media type to hand the model for `rawUrl`, or `null` when it is not an
+ * image link. A path ending in an image extension is trusted as before; any
+ * other link (WhatsApp media is stored under a bare id, no extension) is
+ * accepted only when its host serves an `image/*` Content-Type.
+ */
+async function resolveImageMediaType(
+  rawUrl: string | null,
+): Promise<string | null> {
+  const url = rawUrl?.trim()
+  if (!(url && HTTP_URL_RE.test(url))) {
+    return null
+  }
+  if (isImageUrl(url)) {
+    return "image/*"
+  }
+  return await probeImageMimeType(url)
+}
+
+export async function handleAIAnalyzeImage({
+  conversation,
+  contactInbox,
+  step,
+  sentByUserId,
+}: ExecuteStepProps<AIAnalyzeImageSchema>): Promise<ExecuteStepResult> {
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), aiTimeouts.aiTotal)
+
+  try {
+    const resolvedModel = await resolveFlowAIModel({
+      workspaceId: conversation.workspaceId,
+      provider: step.provider,
+      integrationId:
+        step.provider === "openaiCompatible" ? step.integrationId : undefined,
+      modelId: step.model,
+      conversationId: conversation.id,
+    })
+
+    if (!resolvedModel.ok) {
+      logger.warn(
+        {
+          workspaceId: conversation.workspaceId,
+          conversationId: conversation.id,
+          stepId: step.id,
+          stepType: step.stepType,
+          provider: step.provider,
+          integrationId:
+            step.provider === "openaiCompatible"
+              ? step.integrationId
+              : undefined,
+          modelId: step.model,
+          reason: resolvedModel.reason,
+        },
+        "[ai-analyze-image] Failed to resolve AI model",
+      )
+      return {
+        status: "error",
+        errorMessage: resolvedModel.message,
+        result: null,
+      }
+    }
+
+    // Resolve Image URL
+    const imageUrl = await readCustomFieldValue({
+      contactId: conversation.contactId,
+      customFieldId: step.inputFieldId,
+    })
+    const mediaType = await resolveImageMediaType(imageUrl)
+    if (!(imageUrl && mediaType)) {
+      return {
+        status: "error",
+        errorMessage: "Invalid image URL provided",
+        result: null,
+      }
+    }
+
+    // The prompt is authored with the variable picker; resolve `{{var}}`
+    // before it reaches the model (a no-op without placeholders).
+    const prompt = await resolveContactVariablesDeep(
+      conversation.contactId,
+      step.prompt,
+      { contactInbox, conversation, sentByUserId },
+    )
+
+    // `textStream` drops error parts, so keep the provider error and rethrow
+    // it once the stream ends — otherwise a failed call reports success.
+    let streamError: unknown
+    const result = streamText({
+      model: resolvedModel.model,
+      instructions: buildChannelLengthInstruction(contactInbox.channel),
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: prompt },
+            { type: "file", data: imageUrl.trim(), mediaType },
+          ],
+        },
+      ],
+      maxOutputTokens: step.maxOutputTokens,
+      temperature: step.temperature,
+      abortSignal: controller.signal,
+      onError: ({ error }) => {
+        streamError = error
+      },
+    })
+
+    const { fullText } = await processStreamingText(
+      result.textStream,
+      async () => {
+        // noop: fullText is accumulated internally, no message to send
+      },
+      { sendParts: false },
+    )
+    if (streamError) {
+      throw streamError
+    }
+
+    if (step.outputFieldId) {
+      await saveResultToCustomField({
+        contactId: conversation.contactId,
+        customFieldId: step.outputFieldId,
+        fullText,
+        workspaceId: conversation.workspaceId,
+        contactInboxId: contactInbox.id,
+      })
+    }
+
+    return { status: "success", result: null }
+  } catch (err) {
+    const error = normalizeError(err)
+    logger.error(error, "[ai-analyze-image] Step failed")
+    await logStepProviderError(
+      aiErrorLogProvider(step.provider),
+      { conversation, contactInbox },
+      err,
+    )
+    return { status: "error", errorMessage: error.message, result: null }
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}

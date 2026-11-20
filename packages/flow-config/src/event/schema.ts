@@ -1,0 +1,240 @@
+import { z } from "zod"
+import type { MetadataPayload } from "../nodes/send-message"
+
+export const messageEventTypeSchema = z.enum([
+  "message:sent",
+  "message:delivered",
+  "message:seen",
+  "message:failed",
+  "message:received",
+])
+export type MessageEventType = z.infer<typeof messageEventTypeSchema>
+
+export const flowEventTypeSchema = z.enum(["flow:clicked", "flow:ref"])
+export type FlowEventType = z.infer<typeof flowEventTypeSchema>
+
+export const eventContextSchema = z.object({
+  workspaceId: z.string(),
+  contactId: z.string(),
+  conversationId: z.string(),
+  channel: z.string(),
+  contactInboxId: z.string().optional(),
+  inboxId: z.string().optional(),
+  sequenceStepId: z.string().optional(),
+  /**
+   * The contact's channel-side id (`ContactInbox.sourceId`) — a Messenger PSID,
+   * an IGSID, a WhatsApp `wa_id`. NOT the provider *message* id: that is
+   * `messageActionSchema.sourceId`, which lives on `action`, not here.
+   *
+   * Carried so `recordProviderErrorLog` can put it on `ErrorLog.sourceId`,
+   * which is the only thing attributing a failure that has no `Contact` row yet
+   * (a creation-path `getProfile` failure, a Lead Ads lead). No surface renders
+   * it today — the builder's table shows `contactId` only and the
+   * `analytics`-scoped public route strips it — so treat it as stored, not
+   * displayed. Every emit site builds `context` from a `ContactInbox` it
+   * already holds, so this costs no extra read.
+   *
+   * `.optional()` because `emit` serializes with `JSON.stringify`, which drops
+   * `undefined` keys — an absent source id must be absent, not null, to survive
+   * the round trip through the Redis stream unchanged.
+   */
+  sourceId: z.string().optional(),
+})
+
+export type EventContext = z.infer<typeof eventContextSchema>
+
+export const messageActionSchema = z.object({
+  flowId: z.string().optional(),
+  flowVersionId: z.string().optional(),
+  sourceId: z.string().optional(),
+  messageId: z.string().optional(),
+  messageDetail: z.record(z.string(), z.unknown()).optional(),
+})
+
+export type MessageAction = z.infer<typeof messageActionSchema>
+
+export const clickTypeSchema = z.enum(["button", "quick_reply", "magic_link"])
+export type ClickType = z.infer<typeof clickTypeSchema>
+
+export const flowClickActionSchema = z.object({
+  flowId: z.string(),
+  buttonId: z.string().optional(),
+  nodeId: z.string().optional(),
+  broadcastId: z.string().optional(),
+  sequenceStepId: z.string().optional(),
+  /**
+   * Set when the flow that sent this button was a comment automation's reply.
+   * Unlike `broadcastId`/`sequenceStepId` it names the automation, not the
+   * exact reply — a Facebook comment id is `{storyId}_{commentId}` and the
+   * button payload carries bigints only. See
+   * `markClickedForAutomationContacts`.
+   */
+  commentAutomationId: z.string().optional(),
+  magicLinkId: z.string().optional(),
+  clickType: clickTypeSchema,
+})
+export type FlowClickAction = z.infer<typeof flowClickActionSchema>
+
+export const refLinkActionSchema = z.object({
+  refId: z.string(),
+  refType: z.enum(["entryPoint"]),
+})
+
+export type RefLinkAction = z.infer<typeof refLinkActionSchema>
+
+const baseMessagePayloadSchema = z.object({
+  context: eventContextSchema,
+  action: messageActionSchema,
+  stepId: z.string().optional(),
+  nodeId: z.string().optional(),
+  occurredAt: z.date(),
+  metadata: z.custom<MetadataPayload>().optional(),
+})
+
+export const sentPayloadSchema = baseMessagePayloadSchema.extend({})
+export const failedPayloadSchema = baseMessagePayloadSchema.extend({
+  errorData: z.unknown(),
+  /**
+   * Stack frames of the value that was actually thrown, captured at the emit
+   * site with `resolveStackFrames` and destined for `ErrorLog.stackTrace`.
+   *
+   * It rides beside `errorData` rather than inside it because `errorData` is
+   * whatever `parseSdkError` produced — a `ParsedError`, which has no `stack`
+   * and is also what the provider-facing shape is validated against. By the
+   * time `recordProviderErrorLog` reads this payload the `Error` is long gone,
+   * so a stack it did not carry can never be recovered.
+   *
+   * Optional: emitters with no local throw (a provider's async delivery status)
+   * leave it unset, as do in-flight payloads written before this shipped.
+   * `JSON.stringify` drops `undefined` keys, so absent must mean absent.
+   */
+  errorStack: z.string().optional(),
+  /**
+   * Whether another `message:failed` for this same send is still to come — a
+   * BullMQ attempt still in hand, or a caller that catches and re-emits.
+   *
+   * One send can emit this event several times, so a listener that reacts only
+   * to its final outcome — `recordProviderErrorLog` — needs to know which
+   * emission ends it, or it records the failure twice or not at all. Only the
+   * emitter can tell: `errorData.isRetryable` describes the provider's error,
+   * not what the worker will do with it, and the two disagree exactly where it
+   * matters (`shouldSuppressRetryableChannelError` abandons a retryable send on
+   * its first attempt).
+   *
+   * Optional: emitters with nothing following them (a provider's async delivery
+   * status) leave it unset, and listeners fall back to the error's own
+   * retryability.
+   */
+  willRetry: z.boolean().optional(),
+})
+export const deliveredPayloadSchema = baseMessagePayloadSchema.extend({
+  /**
+   * When the provider says the message was delivered, as opposed to
+   * `occurredAt` (when we processed the receipt). Additive and optional: every
+   * existing delivered listener keeps reading `occurredAt` unchanged, and a
+   * receipt without a usable timestamp leaves it unset.
+   */
+  providerOccurredAt: z.date().optional(),
+})
+export const seenPayloadSchema = baseMessagePayloadSchema.extend({})
+
+/** The contact-info kinds a message can carry; mirrors the database `contactInfoTypes`. */
+export const contactInfoCaptureInfoTypeSchema = z.enum(["phone", "email"])
+export type ContactInfoCaptureInfoType = z.infer<
+  typeof contactInfoCaptureInfoTypeSchema
+>
+
+/**
+ * Set on an inbound message in which a phone number and/or an email address
+ * was extracted. Carries only the kinds and the conversation, never the value;
+ * everything else the capture job needs is already on the payload.
+ */
+export const contactInfoCapturePayloadSchema = z.object({
+  infoTypes: z.array(contactInfoCaptureInfoTypeSchema).min(1),
+  conversationId: z.string(),
+  /**
+   * When the conversation was created (ISO). Lets the capture search stop at the
+   * conversation's first message without reading the conversation. Optional so
+   * events already on the stream keep working.
+   */
+  conversationCreatedAt: z.iso.datetime().optional(),
+})
+
+export const receivedPayloadSchema = z.object({
+  workspaceId: z.string(),
+  contactId: z.string(),
+  contactInboxId: z.string(),
+  channel: z.string(),
+  inboxId: z.string(),
+  sourceId: z.string().optional(),
+  occurredAt: z.date(),
+  // `message:received` is also emitted for outbound delivery-status echoes
+  // (see message-status.ts) — `origin: "inbound"` is the discriminant that
+  // tells apart a genuine contact-authored message from those. Optional so
+  // existing listeners (mac-tracking, active-hourly) are unaffected.
+  origin: z.literal("inbound").optional(),
+  messageId: z.string().optional(),
+  conversationId: z.string().optional(),
+  // Whether this was the contact's first-ever inbound message on this
+  // contactInbox, computed before the tracking update runs (see
+  // received-message.ts) since `ContactInbox.firstInteractionAt`/
+  // `lastIncomingMessageAt` get set by outbound sends too and can't be used
+  // to infer this after the fact.
+  isFirstIncomingMessage: z.boolean().optional(),
+  // Present only when the inbound message carried a phone/email; consumed by
+  // the `contact-info-capture` listener. Absent costs nothing on the wire.
+  contactInfoCapture: contactInfoCapturePayloadSchema.optional(),
+})
+export type MessageReceivedPayload = z.infer<typeof receivedPayloadSchema>
+
+export const messageEventSchemas = {
+  [messageEventTypeSchema.enum["message:sent"]]: sentPayloadSchema,
+  [messageEventTypeSchema.enum["message:failed"]]: failedPayloadSchema,
+  [messageEventTypeSchema.enum["message:delivered"]]: deliveredPayloadSchema,
+  [messageEventTypeSchema.enum["message:seen"]]: seenPayloadSchema,
+  [messageEventTypeSchema.enum["message:received"]]: receivedPayloadSchema,
+} as const
+
+export const clickedPayloadSchema = z.object({
+  context: eventContextSchema,
+  action: flowClickActionSchema,
+  stepId: z.string().optional(),
+  nodeId: z.string().optional(),
+  occurredAt: z.date(),
+})
+export type ClickedPayload = z.infer<typeof clickedPayloadSchema>
+
+export const refLinkPayloadSchema = z.object({
+  context: eventContextSchema,
+  action: refLinkActionSchema,
+  occurredAt: z.date(),
+})
+
+export const flowEventSchemas = {
+  [flowEventTypeSchema.enum["flow:clicked"]]: clickedPayloadSchema,
+  [flowEventTypeSchema.enum["flow:ref"]]: refLinkPayloadSchema,
+} as const
+
+export const contactSenderTypeSchema = z.enum(["bot", "human"])
+export type ContactSenderTypeSchema = z.infer<typeof contactSenderTypeSchema>
+
+export const botMessageResponseTypeSchema = z.enum([
+  "automated_response",
+  "ai_agent",
+  "flow",
+  "none",
+])
+export const botMessageRouteTypeSchema = z.enum(["flow", "agent", "fallback"])
+export const botMessageResultSchema = z.enum(["success", "fallback"])
+
+export const botMessagePayloadSchema = z.object({
+  workspaceId: z.string(),
+  messageId: z.string(),
+  conversationId: z.string(),
+  occurredAt: z.union([z.date(), z.string(), z.number()]),
+  hasResponse: z.boolean(),
+  responseType: botMessageResponseTypeSchema.optional(),
+  routeType: botMessageRouteTypeSchema.optional(),
+  result: botMessageResultSchema.optional(),
+  aiProvider: z.string().optional(),
+})

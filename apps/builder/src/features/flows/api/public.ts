@@ -1,0 +1,525 @@
+import {
+  flowService,
+  flowVersionService,
+  messengerWelcomeMessageFlowService,
+} from "@chatbotx.io/business"
+import {
+  ChatbotXException,
+  notFoundException,
+  validationException,
+} from "@chatbotx.io/business/errors"
+import { importService } from "@chatbotx.io/business/import"
+import { stepTypes } from "@chatbotx.io/flow-config"
+import { zodBigintAsString } from "@chatbotx.io/utils"
+import { DefaultJobAction, defaultQueue } from "@chatbotx.io/worker-config"
+import { z } from "zod"
+import { flowVersionResource } from "@/features/flow-versions/schema/resource"
+import { hasWorkspacePermission } from "@/lib/auth/permission-routes"
+import { mcpSpec } from "@/lib/orpc/mcp-annotations"
+import {
+  possibleErrorsOnCreatingResource,
+  possibleErrorsOnDeletingResource,
+  possibleErrorsOnFindingResource,
+  possibleErrorsOnMutatingResource,
+} from "@/lib/orpc/orpc-error-helper"
+import {
+  publicListRequest,
+  publicListResponse,
+  publicSortRequest,
+} from "@/lib/public-api/list"
+import { publicIdParam } from "@/lib/public-api/params"
+import { workspaceTokenAuthAPIForScope } from "@/orpc"
+import {
+  compileAndValidateSpec,
+  compileSpecToGraph,
+} from "../lib/compile-spec-to-graph"
+import { resolveFlowGraphInput } from "../lib/resolve-flow-graph-input"
+import {
+  createFlowRequest,
+  flowSpecRequest,
+  publishFlowRequest,
+  publishFlowSchema,
+  updateDraftFlowRequest,
+  updateFlowSchema,
+} from "../schema/action"
+import {
+  flowResource,
+  flowWithVersionsResource,
+  welcomeMessageFlowResource,
+} from "../schema/resource"
+
+const workspaceTokenAuthAPI = workspaceTokenAuthAPIForScope("automation")
+
+const exportFailure = (
+  reason: "notFound" | "notPublished" | "noDraft" | "viewOnly",
+) => {
+  if (reason === "notFound") {
+    return notFoundException("Flow not found")
+  }
+  if (reason === "viewOnly") {
+    return new ChatbotXException(
+      "This flow was installed from a view-only template and can not be exported",
+      "templateAllowEditViolation",
+      403,
+    )
+  }
+  return reason === "noDraft"
+    ? new ChatbotXException(
+        "The flow has no draft to export",
+        "flowNoDraft",
+        409,
+      )
+    : new ChatbotXException(
+        "The flow has no published version to export",
+        "flowNotPublished",
+        409,
+      )
+}
+
+export const flowsPublicRouter = {
+  list: workspaceTokenAuthAPI
+    .route({
+      method: "GET",
+      path: "/v1/flows",
+      summary: "List flows",
+      description:
+        "Use this to find flow ids and names before fetching one with `flows.get` or publishing a draft with `flows.publish`. Returns active flows in the workspace, newest first unless `sort` is given. Filter by `name` (substring), `folderId`, or `startType` to pick a flow for a template broadcast.",
+      tags: ["Flows"],
+      spec: mcpSpec({ visibility: "default" }),
+    })
+    .input(
+      publicListRequest.extend({
+        active: z
+          .boolean()
+          .optional()
+          .default(true)
+          .describe(
+            "Restrict to active flows. Set to false to include inactive ones too.",
+          ),
+        enableInInbox: z
+          .boolean()
+          .optional()
+          .describe(
+            "Restrict to flows that can be started from the inbox (`enableInInbox` true). Omit for all flows.",
+          ),
+        name: z
+          .string()
+          .nullish()
+          .describe("Case-insensitive substring match on the flow name."),
+        folderId: zodBigintAsString()
+          .nullish()
+          .describe(
+            'Folder id to filter by. Pass "0" for flows in no folder. Omit for all folders.',
+          ),
+        startType: z
+          .enum([
+            stepTypes.enum.sendWaTemplateMessage,
+            stepTypes.enum.sendMessengerTemplateMessage,
+          ])
+          .optional()
+          .describe(
+            "Only flows whose start node, in the draft or the published version, has a step that sends this kind of template message. `sendWaTemplateMessage` also needs `integrationWhatsappId`, otherwise nothing matches.",
+          ),
+        integrationWhatsappId: zodBigintAsString()
+          .optional()
+          .describe(
+            "With `startType` `sendWaTemplateMessage`: only flows whose template belongs to this WhatsApp channel id. Get it from `whatsappChannels.list`; an id that is not in this workspace returns 404.",
+          ),
+        sort: publicSortRequest(["name", "createdAt", "updatedAt"]),
+      }),
+    )
+    .output(
+      publicListResponse(
+        flowResource.pick({
+          id: true,
+          name: true,
+          folderId: true,
+          active: true,
+          enableInInbox: true,
+        }),
+      ),
+    )
+    .errors(possibleErrorsOnFindingResource)
+    .handler(async ({ context, input }) => {
+      const { data, pageCount } = await flowService.list({
+        ...input,
+        // A mobile member without the `flows` permission may only see the
+        // flows meant to be started from the inbox, whatever they ask for.
+        enableInInbox:
+          context.member &&
+          !hasWorkspacePermission(context.member.permissions, "flows")
+            ? true
+            : input.enableInInbox,
+        workspaceId: context.workspace.id,
+        sort: input.sort ?? [{ id: "createdAt", desc: true }],
+      })
+      return { data: data.map(toPublicFlowListItem), pageCount }
+    }),
+
+  get: workspaceTokenAuthAPI
+    .route({
+      method: "GET",
+      path: "/v1/flows/{id}",
+      summary: "Get flow",
+      description:
+        "Use this to inspect one flow and its versions after finding its id with `flows.list`. Call `flows.updateDraft` to change the draft or `flows.publish` to create a version. `welcomeMessageFlows` lists the Meta welcome message flow created on each Messenger page from the published starting step (refreshed a few seconds after `flows.publish`); use its id in Click-to-Messenger ads.",
+      tags: ["Flows"],
+      spec: mcpSpec({ visibility: "default" }),
+    })
+    .input(publicIdParam("flow", "flows.list"))
+    .output(
+      flowWithVersionsResource.and(
+        z.object({ welcomeMessageFlows: z.array(welcomeMessageFlowResource) }),
+      ),
+    )
+    .errors(possibleErrorsOnFindingResource)
+    .handler(async ({ context, input }) => {
+      const scope = { workspaceId: context.workspace.id }
+      const [flow, welcomeMessageFlows] = await Promise.all([
+        flowService.findById({ ...scope, id: input.id }),
+        messengerWelcomeMessageFlowService.listCurrentByFlow({
+          ...scope,
+          flowId: input.id,
+        }),
+      ])
+      return { ...flow, welcomeMessageFlows }
+    }),
+
+  listNodes: workspaceTokenAuthAPI
+    .route({
+      method: "GET",
+      path: "/v1/flows/{id}/nodes",
+      summary: "List flow nodes",
+      description:
+        "Lists the nodes (canvas blocks) of a flow's published version: `nodeId`, the node's display `label` and `nodeType`. Get the flow id from `flows.list`. A node is identified by its flow and node id together, so the `Executed Step` contact filter takes it as `{flowId}:{nodeId}`. Returns an empty list for a flow that was never published. The same `flowId` and `nodeId` start a flow at that node from a trigger's `startExternalStep` action.",
+      tags: ["Flows"],
+    })
+    .input(publicIdParam("flow", "flows.list"))
+    .output(
+      z.object({
+        data: z.array(
+          z.object({
+            flowId: z.string().describe("Id of the flow the node belongs to."),
+            nodeId: z.string().describe("Node id within its flow."),
+            label: z.string().describe("Node display name on the canvas."),
+            nodeType: z
+              .string()
+              .nullable()
+              .describe("Node type, e.g. `sendMessage` or `condition`."),
+          }),
+        ),
+      }),
+    )
+    .errors(possibleErrorsOnFindingResource)
+    .handler(async ({ context, input }) => ({
+      data: await flowService.listNodes({
+        workspaceId: context.workspace.id,
+        flowId: input.id,
+      }),
+    })),
+
+  create: workspaceTokenAuthAPI
+    .route({
+      method: "POST",
+      path: "/v1/flows",
+      summary: "Create flow",
+      description:
+        "Creates a flow. With no `spec`/`nodes` it starts a draft with one default start node. Supply `spec` (flow-spec DSL, see `GET /v1/schemas/flow-spec`) or a raw `nodes`/`edges` graph to seed the draft in the same call — node `position`/`measured`, node ids, and edge ids/handles are all generated server-side (a raw node's `id` is only a request-scoped token for wiring `edges`; the response's `nodeIds` maps each authored id to its persisted id). Add `publish: true` to validate the graph exactly like `flows.publish` and create the flow's first version immediately. Use `flows.list` to inspect existing flows first.",
+      successStatus: 201,
+      tags: ["Flows"],
+      spec: mcpSpec({ visibility: "default" }),
+    })
+    .input(createFlowRequest)
+    .output(
+      z.object({
+        id: z.string(),
+        nodeIds: z
+          .optional(z.record(z.string(), z.string()))
+          .describe(
+            "Authored node id → persisted node id, present only when the request sent raw `nodes` (omitted for `spec` input, which has no authored ids).",
+          ),
+      }),
+    )
+    .errors(possibleErrorsOnCreatingResource)
+    .handler(async ({ context, input }) => {
+      const workspaceId = context.workspace.id
+      const { name, folderId, spec, nodes, edges, publish } = input
+      // Compile/validate before any write, so a rejected graph creates no flow row.
+      const graph = await resolveFlowGraphInput(
+        { spec, nodes, edges },
+        workspaceId,
+        { validate: publish === true },
+      )
+      const flow =
+        publish && graph
+          ? await flowService.createPublished({
+              workspaceId,
+              data: { name, folderId },
+              graph,
+            })
+          : await flowService.createDraft({
+              workspaceId,
+              data: { name, folderId },
+              graph,
+            })
+      return { id: flow.id, nodeIds: graph?.nodeIds }
+    }),
+
+  update: workspaceTokenAuthAPI
+    .route({
+      method: "PATCH",
+      path: "/v1/flows/{id}",
+      summary: "Update flow settings",
+      description:
+        "Partially updates a flow's name, active, or enableInInbox flags. A new name is also applied to the flow's existing Meta welcome message flows (best-effort, asynchronous).",
+      successStatus: 204,
+      tags: ["Flows"],
+    })
+    .input(updateFlowSchema.and(publicIdParam("flow", "flows.list")))
+    .errors(possibleErrorsOnMutatingResource)
+    .handler(async ({ context, input }) => {
+      const { id, ...data } = input
+      await flowService.update({ workspaceId: context.workspace.id, id }, data)
+    }),
+
+  delete: workspaceTokenAuthAPI
+    .route({
+      method: "DELETE",
+      path: "/v1/flows/{id}",
+      summary: "Delete flow",
+      description:
+        "Permanently deletes a flow and its draft/published versions. Use `flows.get` to confirm it first. Also deletes its Meta welcome message flows (best-effort, asynchronous).",
+      successStatus: 204,
+      tags: ["Flows"],
+    })
+    .input(publicIdParam("flow", "flows.list"))
+    .errors(possibleErrorsOnDeletingResource)
+    .handler(async ({ context, input }) => {
+      await flowService.deleteMany({
+        workspaceId: context.workspace.id,
+        ids: [input.id],
+      })
+    }),
+
+  duplicate: workspaceTokenAuthAPI
+    .route({
+      method: "POST",
+      path: "/v1/flows/{id}/duplicate",
+      summary: "Duplicate flow",
+      description:
+        "Copies a flow within the workspace. The copy gets the source's draft; if the source is published the copy is published too with the same graph and `active` kept, otherwise it is a draft-only flow that starts inactive. References the flow makes to itself point at the copy. Named `<name> _copy`, then `_copy 2`, … . Inspect the source with `flows.get`; edit the copy with `flows.updateDraft` and publish a draft-only copy with `flows.publish`.",
+      successStatus: 201,
+      tags: ["Flows"],
+    })
+    .input(publicIdParam("flow", "flows.list"))
+    .output(z.object({ id: z.string() }))
+    .errors(possibleErrorsOnMutatingResource)
+    .handler(async ({ context, input }) => {
+      const id = await flowService.duplicate({
+        workspaceId: context.workspace.id,
+        id: input.id,
+      })
+      return { id }
+    }),
+
+  publish: workspaceTokenAuthAPI
+    .route({
+      method: "POST",
+      path: "/v1/flows/{id}/publish",
+      summary: "Publish flow",
+      description:
+        "Creates an immutable version from a draft and synchronizes the draft to match. Call `flows.validate` before this when supplying a spec, or use `flows.updateDraft` to save changes without publishing. Also syncs the Meta welcome message flow on every Messenger page (best-effort, asynchronous); read the ids from `flows.get`.",
+      successStatus: 204,
+      tags: ["Flows"],
+      spec: mcpSpec({ visibility: "default" }),
+    })
+    .input(publishFlowRequest.and(publicIdParam("flow", "flows.list")))
+    .errors(possibleErrorsOnMutatingResource)
+    .handler(async ({ context, input }) => {
+      const { id } = input
+      const workspaceId = context.workspace.id
+      const { nodes, edges } =
+        "spec" in input
+          ? await compileAndValidateSpec(input.spec, workspaceId)
+          : input
+      await flowVersionService.publish({
+        workspaceId,
+        flowId: id,
+        nodes,
+        edges,
+      })
+    }),
+
+  validate: workspaceTokenAuthAPI
+    .route({
+      method: "POST",
+      path: "/v1/flows/validate",
+      summary: "Compile and validate flow spec without publishing",
+      description:
+        "Compiles a flow-spec DSL object (see `GET /v1/schemas/flow-spec`) and validates the result exactly like `flows.publish` would, without persisting anything. On success, returns the compiled node/edge graph. On failure, returns a 422 with structured errors (`path`/`code`/`message`/`hint`/`candidates`) — fix and retry before calling `flows.publish`.",
+      tags: ["Flows"],
+      spec: mcpSpec({
+        hitlPolicy: "none",
+        readOnlyHint: true,
+        visibility: "default",
+      }),
+    })
+    .input(flowSpecRequest)
+    .output(publishFlowSchema)
+    .errors(possibleErrorsOnMutatingResource)
+    .handler(async ({ context, input }) => {
+      const { nodes, edges } = await compileAndValidateSpec(
+        input.spec,
+        context.workspace.id,
+      )
+      return { nodes, edges }
+    }),
+
+  updateDraft: workspaceTokenAuthAPI
+    .route({
+      method: "PUT",
+      path: "/v1/flows/{id}/draft",
+      summary: "Update flow draft",
+      description:
+        "Overwrites the draft version's nodes/edges in place, without publishing. Accepts either the raw `{ nodes, edges }` graph the builder UI sends, or `{ spec }` compiled server-side into that same graph — draft nodes are not otherwise validated (see `flows.validate` to check a spec before writing it). Unlike `flows.create`, a raw node's `id` is persisted verbatim, not remapped, so it must already be a numeric string (the same format `flows.create`'s `nodeIds` response and `flows.get` return).",
+      successStatus: 204,
+      tags: ["Flows"],
+      spec: mcpSpec({ visibility: "default" }),
+    })
+    .input(updateDraftFlowRequest.and(publicIdParam("flow", "flows.list")))
+    .errors(possibleErrorsOnMutatingResource)
+    .handler(async ({ context, input }) => {
+      const { id } = input
+      const workspaceId = context.workspace.id
+      const { nodes, edges } =
+        "spec" in input
+          ? await compileSpecToGraph(input.spec, workspaceId)
+          : input
+      await flowVersionService.updateDraftByFlowId({
+        workspaceId,
+        flowId: id,
+        nodes,
+        edges,
+      })
+    }),
+
+  versions: workspaceTokenAuthAPI
+    .route({
+      method: "GET",
+      path: "/v1/flows/{id}/versions",
+      summary: "List flow versions",
+      description:
+        "Returns every immutable version created by `flows.publish` for this flow, most recent first.",
+      tags: ["Flows"],
+    })
+    .input(publicIdParam("flow", "flows.list"))
+    .output(z.object({ data: z.array(flowVersionResource) }))
+    .errors(possibleErrorsOnFindingResource)
+    .handler(async ({ context, input }) => {
+      const data = await flowVersionService.list({
+        flowId: input.id,
+        workspaceId: context.workspace.id,
+      })
+      return { data }
+    }),
+
+  export: workspaceTokenAuthAPI
+    .route({
+      method: "GET",
+      path: "/v1/flows/{id}/export",
+      summary: "Export flow",
+      description:
+        "The flow's published graph (or its draft with `version: draft`) as a portable export, with the custom and bot fields it uses listed by name. Save the `export` object as a file and upload it with the Files API to import it into another workspace with `flows.import`.",
+      tags: ["Flows"],
+    })
+    .input(
+      publicIdParam("Flow", "flows.list").extend({
+        version: z
+          .enum(["published", "draft"])
+          .optional()
+          .describe("Which graph to export; defaults to `published`."),
+      }),
+    )
+    .output(
+      z.object({
+        fileName: z.string().describe("Suggested file name."),
+        export: z
+          .record(z.string(), z.unknown())
+          .describe("The flow export document."),
+      }),
+    )
+    .errors(possibleErrorsOnFindingResource)
+    .handler(async ({ context, input }) => {
+      const result = await flowService.buildExport({
+        workspaceId: context.workspace.id,
+        id: input.id,
+        version: input.version,
+      })
+      if (!result.ok) {
+        throw exportFailure(result.reason)
+      }
+      return { fileName: result.fileName, export: result.envelope }
+    }),
+
+  import: workspaceTokenAuthAPI
+    .route({
+      method: "POST",
+      path: "/v1/flows/import",
+      summary: "Import flow from uploaded file",
+      description:
+        "Queues an async import job for a flow export file uploaded via the Files API. Returns the import id; poll or watch for completion out of band.",
+      successStatus: 202,
+      tags: ["Flows"],
+    })
+    .input(
+      z.object({
+        fileId: zodBigintAsString().describe(
+          "Id (numeric string) of a previously uploaded flow-export file.",
+        ),
+        folderId: zodBigintAsString()
+          .nullable()
+          .describe(
+            "Folder id (numeric string) to import the flow into, or null for no folder.",
+          ),
+      }),
+    )
+    .output(z.object({ importId: z.string() }))
+    .errors(possibleErrorsOnCreatingResource)
+    .handler(async ({ context, input }) => {
+      const result = await importService.startFlowImport({
+        workspaceId: context.workspace.id,
+        userId: null,
+        fileId: input.fileId,
+        folderId: input.folderId,
+      })
+      if (!result.ok) {
+        throw validationException(
+          "fileId",
+          result.reason === "fileNotFound"
+            ? "File not found"
+            : "File is not a flow import",
+        )
+      }
+
+      await defaultQueue.add(DefaultJobAction.runImport, {
+        type: DefaultJobAction.runImport,
+        data: { importId: result.importId },
+      })
+
+      return { importId: result.importId }
+    }),
+}
+
+const toPublicFlowListItem = (flow: {
+  id: string
+  name: string
+  folderId: string | null
+  active: boolean
+  enableInInbox: boolean
+}) => ({
+  id: flow.id,
+  name: flow.name,
+  folderId: flow.folderId,
+  active: flow.active,
+  enableInInbox: flow.enableInInbox,
+})

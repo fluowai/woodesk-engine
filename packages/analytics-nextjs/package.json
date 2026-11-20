@@ -1,0 +1,47 @@
+{
+  "name": "@chatbotx.io/analytics-nextjs",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./schemas": "./src/schemas/index.ts",
+    "./components/*": "./src/components/*.tsx",
+    "./routes": "./src/routes/index.ts",
+    "./provider/analysis-store-context": "./src/provider/analysis-store-context.tsx",
+    "./provider/analysis-store": "./src/provider/analysis-store.ts",
+    "./provider/analytics-api-context": "./src/provider/analytics-api-context.tsx"
+  },
+  "dependencies": {
+    "@chatbotx.io/analytics": "workspace:*",
+    "@chatbotx.io/database": "workspace:*",
+    "@chatbotx.io/logger": "workspace:*",
+    "@chatbotx.io/redis": "workspace:*",
+    "@chatbotx.io/ui": "workspace:*",
+    "@hookform/resolvers": "^5.2.2",
+    "@orpc/client": "^1.15.4",
+    "@orpc/server": "^1.15.4",
+    "@t3-oss/env-nextjs": "catalog:",
+    "date-fns": "catalog:",
+    "lucide-react": "catalog:",
+    "next-intl": "^4.14.8",
+    "react": "catalog:",
+    "react-hook-form": "catalog:",
+    "zod": "catalog:",
+    "zustand": "^5.0.12"
+  },
+  "devDependencies": {
+    "@chatbotx.io/typescript-config": "workspace:*",
+    "@chatbotx.io/vitest-config": "workspace:*",
+    "@types/node": "catalog:",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "react-dom": "catalog:",
+    "tsx": "catalog:",
+    "vitest": "catalog:"
+  },
+  "scripts": {
+    "check-types": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
+  }
+}

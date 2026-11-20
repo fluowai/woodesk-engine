@@ -1,0 +1,257 @@
+import { db } from "@chatbotx.io/database/client"
+import type { ProductImageInput } from "../../product/service"
+import {
+  type ProductWriteData,
+  productAddonService,
+  productService,
+} from "../../product/service"
+import {
+  dependenciesOn,
+  makeCollector,
+  recordCopy,
+  resolveRef,
+  scopedWhere,
+  updateNotSupported,
+} from "./shared"
+import type {
+  PatchTask,
+  ResourceAdapter,
+  TemplateInstallContext,
+} from "./types"
+
+type TemplateProductAddon = {
+  name: string
+  maxSelections: number
+  addonProductIds: string[]
+}
+
+type TemplateProductVariant = {
+  combination: Record<string, string>
+  price: number
+  isEnabled: boolean
+}
+
+type TemplateProductVariantOption = {
+  name: string
+  values: string[]
+  position: number
+}
+
+type TemplateProductEntry = Omit<ProductWriteData, "workspaceId"> & {
+  sourceId: string
+  images?: ProductImageInput[]
+  variantOptions?: TemplateProductVariantOption[]
+  variants?: TemplateProductVariant[]
+  addons?: TemplateProductAddon[]
+  /** Templates exported before `status` replaced it. */
+  isActive?: boolean
+}
+
+/** A template's product status, read from the boolean older exports carry. */
+const templateProductStatus = (entry: TemplateProductEntry) => {
+  if (entry.status) {
+    return entry.status
+  }
+  return entry.isActive === false ? "draft" : "active"
+}
+
+/**
+ * Products insert without their addons — `ProductAddon.addonProductIds` can
+ * point at a sibling product from this same template that has not been
+ * created yet (a within-category cyclic reference, the same shape as
+ * cross-flow jumps in `flows.ts`). Category/subcategory refs are resolved
+ * eagerly since `productCategories` is a Phase-R manifest, always available
+ * before Phase 1 starts.
+ */
+export const productsAdapter: ResourceAdapter<TemplateProductEntry> = {
+  category: "products",
+  providesKinds: ["product"],
+  consumesKinds: ["productCategory", "product"],
+  deferredKinds: ["product"],
+  trackedKind: "product",
+  folderTypes: [],
+  minFormatVersion: 1,
+  sync: updateNotSupported("products"),
+
+  async insert(
+    ctx: TemplateInstallContext,
+    entries: readonly TemplateProductEntry[],
+  ): Promise<PatchTask[]> {
+    const pendingAddons: {
+      productId: string
+      sourceId: string
+      addons: TemplateProductAddon[]
+    }[] = []
+
+    for (const templateProduct of entries) {
+      const { isActive: _legacyIsActive, ...entry } = templateProduct
+      const categoryId = resolveCategoryReference(ctx, entry.categoryId)
+      const subcategoryId = resolveCategoryReference(ctx, entry.subcategoryId)
+
+      const product = await productService.create({
+        data: {
+          ...entry,
+          status: templateProductStatus(templateProduct),
+          workspaceId: ctx.workspaceId,
+          categoryId,
+          subcategoryId,
+        },
+        tx: ctx.tx,
+      })
+
+      if (entry.addons && entry.addons.length > 0) {
+        pendingAddons.push({
+          productId: product.id,
+          sourceId: entry.sourceId,
+          addons: entry.addons,
+        })
+      }
+      recordCopy(ctx, {
+        category: "products",
+        resourceKind: "product",
+        idMapKind: "product",
+        sourceId: entry.sourceId,
+        resourceId: product.id,
+      })
+    }
+
+    if (pendingAddons.length === 0) {
+      return []
+    }
+    return [
+      {
+        category: "products",
+        apply: async (patchCtx) => {
+          for (const { productId, sourceId, addons } of pendingAddons) {
+            const resolvedAddons = addons.flatMap((addon) => {
+              const addonProductIds = addon.addonProductIds.flatMap(
+                (addonSourceId) => {
+                  const targetId = resolveRef(patchCtx, {
+                    category: "products",
+                    kind: "product",
+                    path: `products.${sourceId}.addons.addonProductIds`,
+                    sourceRef: addonSourceId,
+                  })
+                  return targetId ? [targetId] : []
+                },
+              )
+              // An add-on group none of whose products came along is empty.
+              return addon.addonProductIds.length > 0 &&
+                addonProductIds.length === 0
+                ? []
+                : [{ ...addon, addonProductIds }]
+            })
+            if (resolvedAddons.length === 0) {
+              continue
+            }
+            await productAddonService.createBulk({
+              productId,
+              addons: resolvedAddons,
+              tx: patchCtx.tx,
+            })
+          }
+        },
+      },
+    ]
+  },
+
+  collector: makeCollector({
+    findIds: (query) =>
+      db.query.productModel.findMany({
+        where: scopedWhere(query),
+        columns: { id: true },
+        limit: query.limit,
+      }),
+
+    async collectRows(workspaceId, ids) {
+      const rows = await db.query.productModel.findMany({
+        where: scopedWhere({ workspaceId, ids }),
+        with: {
+          variantOptions: true,
+          variants: true,
+          addons: true,
+          vendor: { columns: { name: true } },
+        },
+      })
+
+      const entries = rows.map((row) => ({
+        sourceId: row.id,
+        name: row.name,
+        shortDescription: row.shortDescription,
+        longDescription: row.longDescription,
+        price: row.price,
+        taxes: row.taxes,
+        discount: row.discount,
+        currency: row.currency,
+        productUrl: row.productUrl,
+        sku: row.sku,
+        inventoryPolicy: row.inventoryPolicy,
+        inventoryQuantity: row.inventoryQuantity,
+        allowOutOfStockPurchase: row.allowOutOfStockPurchase,
+        images: row.images,
+        tags: row.tags,
+        vendor: row.vendor?.name ?? null,
+        rank: row.rank,
+        categoryId: row.categoryId,
+        subcategoryId: row.subcategoryId,
+        status: row.status,
+        isSearchable: row.isSearchable,
+        allowSpecialRequest: row.allowSpecialRequest,
+        isAddonOnly: row.isAddonOnly,
+        variantOptions: row.variantOptions.map((option) => ({
+          name: option.name,
+          values: option.values,
+          position: option.position,
+        })),
+        variants: row.variants.map((variant) => ({
+          combination: variant.combination,
+          price: variant.price,
+          isEnabled: variant.isEnabled,
+        })),
+        // `addonProductIds` are still the real source-workspace ids at
+        // collect time — never remapped here. A same-template addon
+        // reference that points at a product NOT in this selection becomes
+        // a hard dependency below, mirroring `entryPointLinks.flowId`
+        // (except this one is within-category, the same cyclic shape
+        // `productsAdapter.insert`'s own `deferredKinds: ["product"]`
+        // already documents).
+        addons: row.addons.map((addon) => ({
+          name: addon.name,
+          maxSelections: addon.maxSelections,
+          addonProductIds: addon.addonProductIds,
+        })),
+      }))
+
+      const productCategoryIds = [
+        ...new Set(
+          rows.flatMap((row) =>
+            [row.categoryId, row.subcategoryId].filter(
+              (id): id is string => id !== null,
+            ),
+          ),
+        ),
+      ]
+
+      const selectedIds = new Set(ids)
+      const hardDependencies = dependenciesOn(
+        "products",
+        rows.flatMap((row) =>
+          row.addons.flatMap((addon) => addon.addonProductIds),
+        ),
+      ).filter((dependency) => !selectedIds.has(dependency.sourceId))
+
+      return { entries, productCategoryIds, hardDependencies }
+    },
+  }),
+}
+
+const resolveCategoryReference = (
+  ctx: TemplateInstallContext,
+  sourceId: string | null | undefined,
+): string | null =>
+  resolveRef(ctx, {
+    category: "products",
+    kind: "productCategory",
+    path: "products.categoryId",
+    sourceRef: sourceId,
+  })

@@ -1,0 +1,36 @@
+{
+  "name": "@chatbotx.io/filesystem",
+  "version": "0.1.0",
+  "type": "module",
+  "devDependencies": {
+    "@chatbotx.io/typescript-config": "workspace:*",
+    "@chatbotx.io/vitest-config": "workspace:*",
+    "@types/node": "catalog:",
+    "@types/probe-image-size": "^7.2.5",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "catalog:",
+    "@aws-sdk/lib-storage": "^3.1039.0",
+    "@chatbotx.io/database": "workspace:*",
+    "@chatbotx.io/logger": "workspace:*",
+    "@chatbotx.io/utils": "workspace:*",
+    "@t3-oss/env-core": "catalog:",
+    "aws4fetch": "^1.0.20",
+    "image-size": "catalog:",
+    "probe-image-size": "^7.4.0",
+    "zod": "catalog:"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./bounded-fetch": "./src/lib/bounded-fetch.ts",
+    "./node-upload": "./src/lib/node-upload.ts",
+    "./upload-writer": "./src/lib/upload-writer.ts"
+  },
+  "scripts": {
+    "check-types": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
+  }
+}

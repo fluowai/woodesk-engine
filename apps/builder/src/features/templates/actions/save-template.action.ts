@@ -1,0 +1,37 @@
+"use server"
+
+import { templateService } from "@chatbotx.io/business"
+import { zodBigintAsString } from "@chatbotx.io/utils"
+import { saveTemplateRequest } from "../schema/mutation"
+import { templateActionClient } from "./template-action-client"
+
+export const saveTemplateAction = templateActionClient
+  .bindArgsSchemas([zodBigintAsString()])
+  .inputSchema(saveTemplateRequest)
+  .action(
+    async ({
+      ctx: { user, workspace, templateActor },
+      bindArgsParsedInputs: [workspaceId],
+      parsedInput,
+    }) => {
+      const template = await templateService.createOrUpdate({
+        workspaceId,
+        tenantId: workspace.tenantId,
+        createdBy: user.id,
+        name: parsedInput.name,
+        description: parsedInput.description,
+        imageUrl: parsedInput.imageUrl,
+        publisherName: parsedInput.publisherName,
+        youtubeVideoId: parsedInput.youtubeVideoId,
+        testLink: parsedInput.testLink,
+        selection: parsedInput.selection,
+        defaultPermissions: parsedInput.defaultPermissions,
+        createInstallFolder: parsedInput.createInstallFolder,
+        defaultAutoUpdate: parsedInput.defaultAutoUpdate,
+        existingTemplateId: parsedInput.templateId,
+        actor: templateActor,
+      })
+
+      return { templateId: template.id }
+    },
+  )

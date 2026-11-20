@@ -1,0 +1,1698 @@
+import type {
+  CommentReply,
+  ConversationQuickReplyChallenge,
+  ConversationStepChallenge,
+  EmailTrackingPhase,
+  IntegrationType,
+  ProviderAccountEventDetail,
+  ProviderAccountEventKind,
+  ProviderAccountRouteScope,
+} from "@chatbotx.io/database/partials"
+import type { AdsConversionChannel } from "@chatbotx.io/database/schema"
+import type {
+  ContactInboxModel,
+  ConversationModel,
+} from "@chatbotx.io/database/types"
+import {
+  BROADCAST_PAYLOAD_TYPE,
+  type FlowActionTargetType,
+  type MetadataPayload,
+  SEQUENCE_SCHEDULE_PAYLOAD_TYPE,
+  type StepInputResolutionReason,
+} from "@chatbotx.io/flow-config"
+import type {
+  ChannelAudienceEventJobData,
+  CommentAnchor,
+  MessageInboundOrderEntity,
+  OutgoingMessage,
+} from "@chatbotx.io/sdk"
+import type { SendFrom } from "@chatbotx.io/utils/send-from"
+import { type JobsOptions, Queue } from "bullmq"
+import {
+  defaultJobOptions,
+  fakeQueue,
+  getQueueConnection,
+  isNoRedisEnv,
+} from "../../lib/connection"
+import { queueNames } from "../../lib/types"
+import { lowQueue } from "../low"
+import type { BotResponseTrackingContext } from "../types"
+import type { ResolvedFlowFile } from "./flow-response-files"
+
+export * from "./ai-handover-bulk-job-ids"
+export * from "./coexist-job-ids"
+export * from "./contact-scan-job-ids"
+export * from "./contact-sync-job-ids"
+export * from "./flow-response-files"
+export * from "./smtp-job-ids"
+
+export const IntegrationJobAction = {
+  sendFlow: "sendFlow",
+  resumeHeavyStep: "resumeHeavyStep",
+  sendSequenceFlow: "sendSequenceFlow",
+  runRef: "runRef",
+  incomingMessage: "incomingMessage",
+  incomingMessageEcho: "incomingMessageEcho",
+  incomingComment: "incomingComment",
+  tiktokHighIntentComment: "tiktokHighIntentComment",
+  deferredCommentPrivateReply: "deferredCommentPrivateReply",
+  updateIncomingComment: "updateIncomingComment",
+  deleteIncomingComment: "deleteIncomingComment",
+  deleteIncomingMessage: "deleteIncomingMessage",
+  updateIncomingMessage: "updateIncomingMessage",
+  messageReaction: "messageReaction",
+  messageStatus: "messageStatus",
+  runFlowPostback: "runFlowPostback",
+  runFlowQuickReply: "runFlowQuickReply",
+  processAutomatedResonse: "processAutomatedResponse",
+  agentMarkAsRead: "agentMarkAsRead",
+  contactMarkAsRead: "contactMarkAsRead",
+  runChallenge: "runChallenge",
+  resumeWait: "resumeWait",
+  resumeFollowUp: "resumeFollowUp",
+  resumeQuickReplyFollowUp: "resumeQuickReplyFollowUp",
+  resumeStepInputTimeout: "resumeStepInputTimeout",
+  resolveStepInput: "resolveStepInput",
+  blockContact: "blockContact",
+  unblockContact: "unblockContact",
+  assignConversation: "assignConversation",
+  createMessage: "createMessage",
+  sendEmail: "sendEmail",
+  recordEmailTrackingTransition: "recordEmailTrackingTransition",
+  coexistWhatsappBuffer: "coexistWhatsappBuffer",
+  coexistWhatsappFlush: "coexistWhatsappFlush",
+  coexistMessengerSync: "coexistMessengerSync",
+  pollSmtpInbox: "pollSmtpInbox",
+  coexistInstagramSync: "coexistInstagramSync",
+  coexistAttachmentDownload: "coexistAttachmentDownload",
+  adsAutomaticEvent: "adsAutomaticEvent",
+  providerAccountEvent: "providerAccountEvent",
+  whatsappIdentityChange: "whatsappIdentityChange",
+  whatsappCallEvent: "whatsappCallEvent",
+  whatsappCallRecordingReady: "whatsappCallRecordingReady",
+  whatsappCallNativeRecordingFetch: "whatsappCallNativeRecordingFetch",
+  whatsappCallNativeTranscriptFetch: "whatsappCallNativeTranscriptFetch",
+  updateContactAvatar: "updateContactAvatar",
+  channelLabelChange: "channelLabelChange",
+  processCommentAutomation: "processCommentAutomation",
+  commentAIReply: "commentAIReply",
+  processLeadgen: "processLeadgen",
+  processMarketingMessageWebhook: "processMarketingMessageWebhook",
+  processStoryReplyAutomation: "processStoryReplyAutomation",
+  captureTemplateFlowResponse: "captureTemplateFlowResponse",
+  replyToInboundCart: "replyToInboundCart",
+  confirmOrderPayment: "confirmOrderPayment",
+  shopifySync: "shopifySync",
+  shopifyWebhook: "shopifyWebhook",
+  woocommerceSync: "woocommerceSync",
+  woocommerceWebhook: "woocommerceWebhook",
+  // Ads-conversion actions (merged from the retired `adsConversion` queue).
+  evaluateTemplateSent: "evaluateTemplateSent",
+  evaluateConversionTrigger: "evaluateConversionTrigger",
+  sendConversionEvent: "sendConversionEvent",
+  sendMetaCapiEvent: "sendMetaCapiEvent",
+  sendGoogleAdsConversion: "sendGoogleAdsConversion",
+  syncRetargetAudience: "syncRetargetAudience",
+  contactScan: "contactScan",
+  // Conversation routing (thread control).
+  threadControlEvent: "threadControlEvent",
+  threadControlAction: "threadControlAction",
+  aiHandoverTakeBack: "aiHandoverTakeBack",
+  aiHandoverBulkToggle: "aiHandoverBulkToggle",
+  // One budgeted chunk of a contact sync from an external system.
+  contactSync: "contactSync",
+  // Follow/unfollow, group join/leave, group messages and the bot's own group
+  // membership — audience events that are not 1:1 messages (leaderboard scoring).
+  channelAudienceEvent: "channelAudienceEvent",
+} as const
+
+type IntegrationJobActionValue =
+  (typeof IntegrationJobAction)[keyof typeof IntegrationJobAction]
+
+export type IntegrationJobReceiveMessage = {
+  type: typeof IntegrationJobAction.incomingMessage
+  data: {
+    integrationType: string
+    integrationIdentifier: string
+    payload: unknown
+  }
+}
+
+/**
+ * A message the channel echoes back for something the account itself sent (a
+ * Page-inbox reply, a third-party app, an OA send). Same payload as
+ * `incomingMessage`, but nobody waits on a reply to it, so it is routed to the
+ * `low` queue and never queues ahead of a customer's message.
+ */
+export type IntegrationJobReceiveMessageEcho = {
+  type: typeof IntegrationJobAction.incomingMessageEcho
+  data: IntegrationJobReceiveMessage["data"]
+}
+
+/**
+ * Profiles tagged inside a comment. Facebook resolves these to real user ids
+ * (`message_tags` on the feed webhook); Instagram supplies nothing here and is
+ * resolved from `@handle` text instead — see `comment-automation/comment-tags`.
+ */
+export type CommentTag = {
+  id: string
+  name?: string
+}
+
+/**
+ * BullMQ priority for every send a missed-comment replay makes (replies, DMs,
+ * flows, AI replies, hide/unhide) on the shared `chat`, `integration` and
+ * `aiAgent` queues. Jobs without a priority run before any prioritized job, so
+ * a replay of thousands of comments always yields to live customer traffic.
+ * The replay itself runs on the `low` queue (`LowJobAction.replayMissedComment`).
+ */
+export const MISSED_COMMENT_REPLAY_PRIORITY = 10
+
+/**
+ * BullMQ priority for every send a broadcast makes on the shared `chat` and
+ * `integration` queues — its first job per recipient and each flow step after
+ * it. Unprioritized live traffic (comment replies, inbox messages) runs first,
+ * so a broadcast to thousands of contacts no longer holds a comment reply
+ * behind it. Kept ahead of `MISSED_COMMENT_REPLAY_PRIORITY`: a broadcast is a
+ * scheduled send, a replay is catch-up work.
+ */
+export const BROADCAST_SEND_PRIORITY = 5
+
+/**
+ * BullMQ priority for every send a scheduled sequence makes (its first job per
+ * dispatch and each flow step after it). Same tier as a broadcast: a scheduled
+ * mass send, yielding to live traffic and to flow continuations.
+ */
+export const SEQUENCE_SEND_PRIORITY = 5
+
+const flowJobPriorityByMetadataType: Partial<
+  Record<MetadataPayload["type"], number>
+> = {
+  [BROADCAST_PAYLOAD_TYPE]: BROADCAST_SEND_PRIORITY,
+  [SEQUENCE_SCHEDULE_PAYLOAD_TYPE]: SEQUENCE_SEND_PRIORITY,
+}
+
+/** The BullMQ options a flow job's tier sets. */
+export type FlowJobPriorityOptions = Pick<JobsOptions, "priority">
+
+/**
+ * Job options for a job that continues or schedules a flow run. A mass
+ * scheduled send (`metadata.type` broadcast / sequenceSchedule) keeps its tier
+ * on every step, so it always yields to live traffic. Any other run gets no
+ * priority: its next step stays in FIFO order with customer messages. BullMQ
+ * only takes a prioritized job when no unprioritized one is waiting, so a
+ * lower tier for continuations would let new conversations stall a running
+ * flow indefinitely under sustained load.
+ */
+export const flowContinuationJobOptions = (
+  metadata?: MetadataPayload,
+): FlowJobPriorityOptions => {
+  const priority = metadata && flowJobPriorityByMetadataType[metadata.type]
+  return priority ? { priority } : {}
+}
+
+export type IntegrationJobReceiveComment = {
+  type: typeof IntegrationJobAction.incomingComment
+  data: {
+    integrationType: string
+    integrationIdentifier: string
+    commentData: {
+      commentId: string
+      postId: string
+      parentId?: string
+      fromId: string
+      fromName?: string
+      fromUsername?: string
+      /**
+       * Commenter's profile picture, when the channel's webhook pushes it
+       * directly on the reply payload (Threads) rather than requiring a
+       * separate on-demand profile lookup (Messenger/Instagram). A public
+       * URL — `receiveComment` downloads and re-uploads it to the tenant's
+       * own storage before it ever reaches `Contact.avatar`.
+       */
+      fromAvatarUrl?: string
+      /**
+       * Video attached to the comment, when the channel's webhook pushes its
+       * URL on the payload (Messenger `feed` `value.video`). The Graph
+       * attachment lookup only re-hosts photos and GIFs, so this is the video's
+       * only source — `receiveComment` re-uploads it to the tenant's storage.
+       */
+      videoUrl?: string
+      message?: string
+      tags?: CommentTag[]
+      createdTime: number
+      /**
+       * The channel itself said this is a comment on a live broadcast —
+       * Instagram's `live_comments` webhook field. Facebook has no such
+       * field on `feed`, so its comments arrive without this and
+       * `receiveComment` resolves live-ness from the comment's
+       * `live_broadcast_timestamp`.
+       */
+      isLive?: boolean
+    }
+    /**
+     * Set by "process missed comments": the comment is replayed from the
+     * channel's comment list rather than a webhook, and only this automation
+     * runs on it. Absent on every webhook-driven comment.
+     */
+    replay?: { automationId: string }
+  }
+}
+
+export type IntegrationJobUpdateIncomingComment = {
+  type: typeof IntegrationJobAction.updateIncomingComment
+  data: {
+    integrationType: string
+    integrationIdentifier: string
+    commentId: string
+    newText: string
+  }
+}
+
+export type IntegrationJobDeleteIncomingComment = {
+  type: typeof IntegrationJobAction.deleteIncomingComment
+  data: {
+    integrationType: string
+    integrationIdentifier: string
+    commentId: string
+  }
+}
+
+/**
+ * Optional for the producers that change a stored message by its provider id.
+ * Absent (a Messenger unsend, a job queued before it existed) keeps the original
+ * behavior: a missing row only warns.
+ */
+export type IncomingMessageChangeOptions = {
+  /**
+   * The message may still be on its way (its own job has not stored it yet):
+   * throw on a missing row so the job retries, warn once on the last attempt,
+   * and wait for the conversation's message ingress before publishing the
+   * change (best effort: it is published anyway when the wait times out).
+   */
+  retryIfMissing?: boolean
+}
+
+export type IntegrationJobDeleteIncomingMessage = {
+  type: typeof IntegrationJobAction.deleteIncomingMessage
+  data: {
+    integrationType: string
+    integrationIdentifier: string
+    messageId: string
+  } & IncomingMessageChangeOptions
+}
+
+/** The provider edited a message already stored: replace its text. */
+export type IntegrationJobUpdateIncomingMessage = {
+  type: typeof IntegrationJobAction.updateIncomingMessage
+  data: {
+    integrationType: string
+    integrationIdentifier: string
+    messageId: string
+    newText: string
+  } & IncomingMessageChangeOptions
+}
+
+export type IntegrationJobMessageReaction = {
+  type: typeof IntegrationJobAction.messageReaction
+  data: {
+    integrationType: string
+    integrationIdentifier: string
+    messageId: string
+    action: "react" | "unreact"
+    emoji?: string
+    contactSourceId: string
+  }
+}
+
+export type IntegrationJobChannelAudienceEvent = {
+  type: typeof IntegrationJobAction.channelAudienceEvent
+  data: ChannelAudienceEventJobData
+}
+
+/**
+ * Retries only the post-send tracking transaction of an email recipient (never
+ * the SMTP send). One job per (token, phase): a phase is a first-time-only
+ * transition, so a single repair is enough.
+ */
+export type IntegrationJobRecordEmailTrackingTransition = {
+  type: typeof IntegrationJobAction.recordEmailTrackingTransition
+  data: {
+    phase: EmailTrackingPhase
+    token: string
+    /** Absent only when the token matched no recipient row. */
+    workspaceId?: string
+    /**
+     * The clicked destination, so the repair awards the leaderboard under the
+     * same per-link key the click route uses (no double score).
+     */
+    link?: string
+  }
+}
+
+export type IntegrationJobMessageStatus = {
+  type: typeof IntegrationJobAction.messageStatus
+  data: {
+    integrationType: string
+    integrationIdentifier: string
+    payload: {
+      messageId: string
+      status: "delivered" | "failed" | "read"
+      timestamp: string
+      error?: unknown
+    }
+    /**
+     * Set at ingress when the message this status belongs to can continue a
+     * flow (a template whose Delivered/Failed button is wired to another
+     * node). Such a status stays on the `integration` queue; every other one
+     * is pure bookkeeping and goes to `low`.
+     */
+    continuesFlow?: boolean
+  }
+}
+
+/**
+ * Per-node execution counter carried through `sendFlow` jobs to guard against
+ * infinite flow loops. Maps a node id to the number of times that node has
+ * executed within one uninterrupted run; resets when the flow pauses for the user.
+ */
+export type NodeVisits = Record<string, number>
+
+export type IntegrationJobRunFlowNode = {
+  type: typeof IntegrationJobAction.sendFlow
+  data: {
+    conversationId: string | ConversationModel
+    contactInboxId: string | ContactInboxModel
+    flowId?: string
+    flowVersionId?: string
+    nodeId?: string
+    startFromStepId?: string
+    /** Stable logical execution identity for asynchronous flow continuations. */
+    flowExecutionKey?: string
+    /** Immutable inbound source identity, forwarded across every continuation. */
+    triggerMessageId?: string
+    triggerMessageCreatedAt?: Date
+    /**
+     * Set when this job resumes a button/quickReply's own multi-step chain
+     * (one step per job) rather than a node's. Without it, resolving by
+     * `nodeId` alone lands on the containing node's details instead of the
+     * button/quickReply's, and `startFromStepId` never matches — see
+     * `runFlowNode`.
+     */
+    targetType?: FlowActionTargetType
+    targetId?: string
+    nodeVisits?: NodeVisits
+    trackingContext?: BotResponseTrackingContext
+    metadata?: MetadataPayload
+    /**
+     * The flow stop/resume guard's ONE authoritative "initial broadcast
+     * dispatch" signal (`runFlowNode` in `apps/worker/src/integration/handlers/flow.ts`).
+     * Set to `true` ONLY by `process-broadcast-contacts.ts`'s very first
+     * `sendFlow` enqueue for a broadcast recipient — every re-dispatch
+     * (splitTraffic, startAnotherNode, startExternalFlow/Node, condition
+     * routing, per-step continuation, smart-delay/wait resume, …) must leave
+     * this unset. The guard resets the recipient for Resume only when this
+     * is `true`; a continuation that forgets to omit it would incorrectly
+     * replay the flow head, so every non-producer enqueue site must never
+     * set it. Omitting it fails toward skip-without-reset (under-delivery,
+     * never a duplicate send).
+     */
+    initialBroadcastDispatch?: boolean
+    /**
+     * Preserves bulk delivery across automatic flow continuations. It must not
+     * be set for a flow started by an inbound button or quick reply.
+     */
+    isBulkBroadcast?: boolean
+    appointmentId?: string
+    sendFrom?: SendFrom
+    /**
+     * The inbox user who sent the flow (`sendFrom: "inbox"`), for the
+     * `{{admin_name}}` / `{{admin_team_name}}` variables. Like `sendFrom` it is
+     * not persisted across a Wait or a wait-for-reply step, so it is absent
+     * after one.
+     */
+    sentByUserId?: string
+    /**
+     * Positive identification of a flow run that reacts to a contact's inbound
+     * message (keyword / default-reply / AI / router flows, button and quick
+     * reply taps, challenge answers). Lets the Disable Bot step reopen the
+     * waiting-for-human window. Absent means false: broadcast, sequence,
+     * trigger, wait/smart-delay resumes and every unknown origin never set it,
+     * and continuations that stay in the same message-driven run forward it.
+     */
+    startedByContactMessage?: boolean
+    origin?: "channel"
+    /** See {@link CommentAnchor}. */
+    commentAnchor?: CommentAnchor
+    /**
+     * A continuation that waits for this run's chain to finish. Get User Data
+     * hands its Continue here when it branches, so the branch's messages go
+     * out first: the chain forwards it to its next step or next node, and the
+     * job where the chain stops (waits for the contact, or has nothing after
+     * it) enqueues it, exactly once.
+     *
+     * Known limit: a step that jumps by enqueuing its own run (Condition,
+     * Start Another Node, Split Traffic, Start External Flow/Node) does not
+     * carry it, so when such a step ends the chain the continuation runs
+     * alongside the jumped-to node, as before this field existed.
+     */
+    thenSendFlow?: IntegrationJobRunFlowNode["data"]
+    /**
+     * A node an earlier step of this node's run already branched to. Carried
+     * to the node's next step jobs, so its Continue edge does not send that
+     * node a second time.
+     */
+    branchedNodeId?: string
+  }
+}
+
+/**
+ * Durable continuation for a flow step that completed on the heavy worker.
+ * It reuses the normal send-flow payload so the flow engine remains the sole
+ * owner of success/error routing.
+ */
+export type IntegrationJobResumeHeavyStep = {
+  type: typeof IntegrationJobAction.resumeHeavyStep
+  data: IntegrationJobRunFlowNode["data"] & {
+    outcomeKey: string
+  }
+}
+
+export type IntegrationJobSendFlowPostback = {
+  type: typeof IntegrationJobAction.runFlowPostback
+  data: {
+    conversationId: string | ConversationModel
+    contactInboxId: string | ContactInboxModel
+    action: string
+    ref?: string | null
+    webhookType?: string
+    messageId?: string
+    payload?: {
+      waFlowResponse?: Record<string, unknown> | string
+      /** Stored files of the response's file answers, by response key. */
+      flowFiles?: Record<string, ResolvedFlowFile[]>
+    }
+  }
+}
+
+export type IntegrationJobSendFlowQuickReply = {
+  type: typeof IntegrationJobAction.runFlowQuickReply
+  data: {
+    conversationId: string | ConversationModel
+    contactInboxId: string | ContactInboxModel
+    action: string
+    ref?: string | null
+    inboxId?: string
+    webhookType?: string
+    messageId?: string
+  }
+}
+
+export type IntegrationJobProcessAutomatedResponse = {
+  type: typeof IntegrationJobAction.processAutomatedResonse
+  data: {
+    conversationId: string | ConversationModel
+    contactInboxId: string | ContactInboxModel
+    messageId: string
+  }
+}
+
+export type IntegrationJobAgentMarkAsRead = {
+  type: typeof IntegrationJobAction.agentMarkAsRead
+  data: {
+    conversationId: string | ConversationModel
+  }
+}
+
+export type IntegrationJobContactMarkAsRead = {
+  type: typeof IntegrationJobAction.contactMarkAsRead
+  data: {
+    integrationType: string
+    integrationIdentifier: string
+    sourceConversationId: string
+    payload: unknown
+  }
+}
+
+export type IntegrationJobRunRef = {
+  type: typeof IntegrationJobAction.runRef
+  data: {
+    conversationId: string | ConversationModel
+    contactInboxId: string | ContactInboxModel
+    ref: string
+    messageId?: string
+    isNewContact?: boolean
+  }
+}
+
+export type IntegrationJobRunChallenge = {
+  type: typeof IntegrationJobAction.runChallenge
+  data: {
+    conversationId: string | ConversationModel
+    contactInboxId: string | ContactInboxModel
+    messageId?: string
+    messageCreatedAt?: Date
+    challenge: ConversationStepChallenge | ConversationQuickReplyChallenge
+  }
+}
+
+export type IntegrationJobResumeFollowUp = {
+  type: typeof IntegrationJobAction.resumeFollowUp
+  data: { smartDelayId: string }
+}
+
+export type IntegrationJobResumeQuickReplyFollowUp = {
+  type: typeof IntegrationJobAction.resumeQuickReplyFollowUp
+  data: { smartDelayId: string }
+}
+
+export type IntegrationJobResumeStepInputTimeout = {
+  type: typeof IntegrationJobAction.resumeStepInputTimeout
+  data: { smartDelayId: string }
+}
+
+/**
+ * Ends a pending step input (a `type: "step"` challenge) without a typed
+ * answer: the contact tapped Skip, or the step's timer ran out.
+ * `messageId` is set only when the contact's own tap triggered it.
+ */
+export type IntegrationJobResolveStepInput = {
+  type: typeof IntegrationJobAction.resolveStepInput
+  data: {
+    conversationId: string
+    contactInboxId: string
+    challengeId: string
+    reason: StepInputResolutionReason
+    messageId?: string
+    messageCreatedAt?: Date
+  }
+}
+
+/**
+ * The job (and its dedup id) that ends a pending step input. Every producer
+ * (webhook channels, webchat) builds it here so they cannot drift apart. The
+ * dedup id only holds while a job is waiting or active: a double tap collapses,
+ * while a tap after a finished or no-op resolution is still processed (a fixed
+ * `jobId` would be dropped by the retained completed job). The challenge claim
+ * is the real guard.
+ */
+export const buildResolveStepInputJob = (
+  data: IntegrationJobResolveStepInput["data"],
+): {
+  name: typeof IntegrationJobAction.resolveStepInput
+  data: IntegrationJobResolveStepInput
+  opts: JobsOptions
+} => ({
+  name: IntegrationJobAction.resolveStepInput,
+  data: { type: IntegrationJobAction.resolveStepInput, data },
+  opts: {
+    deduplication: {
+      id: `step-input-${data.conversationId}-${data.challengeId}`,
+    },
+  },
+})
+
+export type IntegrationJobResumeWait = {
+  type: typeof IntegrationJobAction.resumeWait
+  data: { smartDelayId: string }
+}
+
+export type IntegrationJobCreateMessage = {
+  type: typeof IntegrationJobAction.createMessage
+  data: {
+    message: OutgoingMessage
+  }
+}
+
+export type IntegrationJobSendSequenceFlow = {
+  type: typeof IntegrationJobAction.sendSequenceFlow
+  data: {
+    dispatchId: string
+    workspaceId: string
+    stepId: string
+    contactId: string
+    contactInboxId: string
+    enrollmentId: string
+    sequenceId: string
+    bucket: number
+    metadata: MetadataPayload
+  }
+}
+
+/** Buffers a raw WhatsApp Coexistence history payload into the staging table. */
+export type IntegrationJobCoexistWhatsappBuffer = {
+  type: typeof IntegrationJobAction.coexistWhatsappBuffer
+  data: {
+    phoneNumberId: string
+    payload: unknown
+  }
+}
+
+export type IntegrationJobChannelLabelChange = {
+  type: typeof IntegrationJobAction.channelLabelChange
+  data:
+    | {
+        integrationType: "messenger"
+        integrationIdentifier: string
+        payload: unknown
+      }
+    | {
+        integrationType: "zalo"
+        integrationIdentifier: string
+        payload: unknown
+      }
+}
+
+/**
+ * Flushes buffered WhatsApp staging rows into Contact/Message once enabled.
+ * `runId` is optional: the buffer (webhook-driven) omits it and the flush
+ * handler looks up the live run by phoneNumberId. Scheduler + self-continuation
+ * keep passing the explicit runId so they stay pinned to a specific run.
+ */
+export type IntegrationJobCoexistWhatsappFlush = {
+  type: typeof IntegrationJobAction.coexistWhatsappFlush
+  data: {
+    runId?: string
+    phoneNumberId: string
+  }
+}
+
+/** Reads new mail for one IMAP-enabled SMTP inbox and enqueues it as incoming messages. */
+export type IntegrationJobPollSmtpInbox = {
+  type: typeof IntegrationJobAction.pollSmtpInbox
+  data: {
+    integrationId: string
+    workspaceId: string
+  }
+}
+
+/** Pulls historical Messenger conversations/messages via the Graph API. */
+export type IntegrationJobCoexistMessengerSync = {
+  type: typeof IntegrationJobAction.coexistMessengerSync
+  data: {
+    runId: string
+    integrationId: string
+    workspaceId: string
+  }
+}
+
+/** Pulls historical native Instagram conversations/messages via the Graph API. */
+export type IntegrationJobCoexistInstagramSync = {
+  type: typeof IntegrationJobAction.coexistInstagramSync
+  data: {
+    runId: string
+    integrationId: string
+    workspaceId: string
+  }
+}
+
+/**
+ * Downloads a Coexist attachment's bytes from the channel API (Facebook URL
+ * for Messenger; WhatsApp media-id for WhatsApp — both encoded into
+ * `Attachment.originPath` by the historical importer), uploads to object
+ * storage, and UPDATEs the row with the resulting S3 path. Dispatched per
+ * attachment after `bulkImportMessages` inserts the placeholder row.
+ *
+ * Idempotency: jobId `att-${attachmentId}` dedups concurrent enqueues; the
+ * handler additionally checks the originPath prefix to no-op on retries
+ * where a prior worker already finished the upload.
+ */
+export type IntegrationJobCoexistAttachmentDownload = {
+  type: typeof IntegrationJobAction.coexistAttachmentDownload
+  data: {
+    attachmentId: string
+    workspaceId: string
+    channel: "messenger" | "whatsapp" | "instagram"
+    integrationId: string
+  }
+}
+
+/**
+ * One normalized event from Meta's calls webhook field. Mirrors
+ * WhatsappCallEventPayload from the integration package (worker-config can't
+ * depend on integration packages).
+ */
+export type IntegrationJobWhatsappCallEvent = {
+  type: typeof IntegrationJobAction.whatsappCallEvent
+  data: {
+    integrationType: "whatsapp"
+    integrationIdentifier: string
+    payload: {
+      phoneNumberId: string
+      contact?: {
+        /** Absent for a Username/BSUID-only caller (no phone number exposed). */
+        waId?: string
+        /** Business-scoped user id (BSUID). */
+        userId?: string
+        parentUserId?: string
+        username?: string
+        name?: string
+      }
+      event:
+        | {
+            kind: "connect"
+            wacid: string
+            direction: "userInitiated" | "businessInitiated"
+            from?: string
+            to?: string
+            /** BSUID counterparts of from/to (Username/BSUID-only legs). */
+            fromUserId?: string
+            toUserId?: string
+            fromParentUserId?: string
+            toParentUserId?: string
+            timestamp?: string
+            /**
+             * Meta's biz_opaque_callback_data echo (the outbound attemptId).
+             */
+            bizOpaqueCallbackData?: string
+          }
+        | {
+            kind: "terminate"
+            wacid: string
+            direction?: "userInitiated" | "businessInitiated"
+            status: "COMPLETED" | "FAILED"
+            from?: string
+            to?: string
+            fromUserId?: string
+            toUserId?: string
+            fromParentUserId?: string
+            toParentUserId?: string
+            timestamp?: string
+            startTime?: string
+            endTime?: string
+            durationSeconds?: number
+            bizOpaqueCallbackData?: string
+            /** Media-drop diagnosis (e.g. 138021/138022/138023). */
+            errors?: { code?: number; title?: string; message?: string }[]
+          }
+        | {
+            kind: "status"
+            wacid: string
+            status: "RINGING" | "ACCEPTED" | "REJECTED"
+            recipientId?: string
+            /** BSUID counterpart of recipientId. */
+            recipientUserId?: string
+            timestamp?: string
+            bizOpaqueCallbackData?: string
+          }
+    }
+  }
+}
+
+export type WhatsappIdentityChange =
+  | {
+      kind: "userIdChanged"
+      previousUserId?: string
+      userId: string
+      previousParentUserId?: string
+      parentUserId?: string
+      previousPhone?: string
+      newPhone?: string
+    }
+  | {
+      kind: "phoneChanged"
+      previousPhone: string
+      newPhone: string
+      userId?: string
+    }
+
+export type WhatsappIdentityChangePayload = {
+  phoneNumberId: string
+  messageId: string
+  timestamp?: string
+  change: WhatsappIdentityChange
+}
+
+export type IntegrationJobWhatsappIdentityChange = {
+  type: typeof IntegrationJobAction.whatsappIdentityChange
+  data: {
+    integrationType: "whatsapp"
+    integrationIdentifier: string
+    payload: WhatsappIdentityChangePayload
+  }
+}
+
+/**
+ * A call recording landed in object storage. The handler stamps it onto the
+ * WhatsappCall row (by DB callId, never an external id), drops an audio message
+ * into the conversation, fires callRecorded, and chains the transcription job.
+ */
+export type IntegrationJobWhatsappCallRecordingReady = {
+  type: typeof IntegrationJobAction.whatsappCallRecordingReady
+  data: {
+    /** WhatsappCall.id (bigint string) — never a wacid/attemptId. */
+    callId: string
+    /** Enables the worker-level blocked-owner guard. */
+    workspaceId: string
+    /** Object-storage path of the audio file (not a public URL). */
+    recordingPath: string
+    mimeType?: string
+    sizeBytes?: number
+    durationSeconds?: number
+    /** For logs only: wacid ?? attemptId, never used to look the row up. */
+    correlationId?: string
+  }
+}
+
+/**
+ * WhatsappCall.id-keyed, replay-safe jobId shared by every enqueuer so a
+ * duplicate enqueue for the same call is always deduped by BullMQ.
+ */
+export const whatsappCallRecordingReadyJobId = (callId: string): string =>
+  `rec-ready-${callId}`
+
+/**
+ * The webhook's call_recording_available event carries only a short-lived
+ * audio.url + audio.id, so the download must happen promptly. wacid is kept
+ * alongside for idempotent job-id keying since a webhook can be redelivered
+ * before wacid is durably attached.
+ */
+export type IntegrationJobWhatsappCallNativeRecordingFetch = {
+  type: typeof IntegrationJobAction.whatsappCallNativeRecordingFetch
+  data: {
+    /**
+     * WhatsappCall.id (bigint string) — absent when the webhook raced the row-
+     * creating job and the row didn't exist yet. The handler always re-resolves
+     * by wacid, so this is only a fast-path hint.
+     */
+    whatsappCallId?: string
+    /**
+     * calls[].id from the webhook — used for idempotent job-id keying and to
+     * resolve the row when whatsappCallId is absent.
+     */
+    wacid: string
+    /**
+     * Enables the worker-level blocked-owner guard; absent when the row wasn't
+     * resolvable at enqueue time, matching resolveWorkspaceId's fail-open
+     * behavior.
+     */
+    workspaceId?: string
+    /** Graph Media API id for the recording audio. */
+    audioMediaId: string
+    /** Meta's short-lived (~5-min) download URL. */
+    audioUrl: string
+    /** e.g. audio/ogg; codecs=opus. */
+    mimeType: string
+  }
+}
+
+/**
+ * wacid-keyed, replay-safe jobId for the native recording fetch, idempotent
+ * across webhook redelivery.
+ */
+export const whatsappCallNativeRecordingFetchJobId = (wacid: string): string =>
+  `native-rec-fetch-${wacid}`
+
+/**
+ * Meta-native call transcript delivery: the webhook's
+ * call_transcription_available event carries only a media id + short-lived url
+ * — the diarized JSON body is fetched separately by the handler. Independent of
+ * the recording fetch job: the two events race and write disjoint columns, so
+ * neither waits on the other.
+ */
+export type IntegrationJobWhatsappCallNativeTranscriptFetch = {
+  type: typeof IntegrationJobAction.whatsappCallNativeTranscriptFetch
+  data: {
+    /**
+     * WhatsappCall.id (bigint string) — absent when the webhook raced the row-
+     * creating job and the row didn't exist yet. The handler always re-resolves
+     * by wacid.
+     */
+    whatsappCallId?: string
+    /**
+     * calls[].id from the webhook — used for idempotent job-id keying and to
+     * resolve the row when whatsappCallId is absent.
+     */
+    wacid: string
+    /**
+     * Enables the worker-level blocked-owner guard; absent when the row wasn't
+     * resolvable at enqueue time, matching resolveWorkspaceId's fail-open
+     * behavior.
+     */
+    workspaceId?: string
+    /** Graph Media API id for the transcript document. */
+    documentMediaId: string
+    /** Meta's short-lived download URL. */
+    documentUrl: string
+  }
+}
+
+/**
+ * wacid-keyed, replay-safe jobId for the native transcript fetch, distinct from
+ * the recording-fetch job id so the two never collide for the same call.
+ */
+export const whatsappCallNativeTranscriptFetchJobId = (wacid: string): string =>
+  `native-transcript-fetch-${wacid}`
+
+// Speech-to-text over a stored recording moved to the dedicated
+// callTranscription queue so it can carry its own BullMQ limiter independent of
+// this shared queue's traffic.
+
+/** A lifecycle event about the provider-side account behind one or more connections. */
+export type IntegrationJobProviderAccountEvent = {
+  type: typeof IntegrationJobAction.providerAccountEvent
+  data: {
+    integrationType: IntegrationType
+    account: { kind: "businessAccount"; id: string }
+    event: ProviderAccountEventKind
+    /** Provider-reported facts, bounded by the adapter (never raw payload). */
+    detail: ProviderAccountEventDetail
+    /** Event time in epoch milliseconds, as reported by the provider. */
+    occurredAt: number
+    /** Absent until a route stamps it; the worker treats absent as "drop". */
+    routeScope?: ProviderAccountRouteScope
+  }
+}
+
+export type IntegrationJobAdsAutomaticEvent = {
+  type: typeof IntegrationJobAction.adsAutomaticEvent
+  data: {
+    integrationType: "whatsapp"
+    integrationIdentifier: string
+    phoneNumberId: string
+    wabaId: string
+    payload: {
+      event_name: "LeadSubmitted" | "Purchase"
+      id: string
+      timestamp: number | string
+      ctwa_clid: string
+      custom_data?: {
+        currency: string
+        value: number | string
+      }
+    }
+  }
+}
+
+// Ads-conversion job-data variants (merged from the retired `adsConversion`
+// queue).
+// Kept as `AdsConversionJob*` type names since `@chatbotx.io/business` and the
+// handlers under `apps/worker/src/integration/handlers/ads-conversion/` import
+// them by these names.
+
+export type AdsConversionJobSendConversionEvent = {
+  type: typeof IntegrationJobAction.sendConversionEvent
+  data: {
+    adsConversionEventId: string
+    workspaceId: string
+  }
+}
+
+/**
+ * `attempt` is the event's redrive generation (distinct from BullMQ's
+ * `attemptsMade`): a job only claims the event while it is still that
+ * generation, so a stale job can never double-send.
+ */
+export type IntegrationJobSendGoogleAdsConversion = {
+  type: typeof IntegrationJobAction.sendGoogleAdsConversion
+  data: {
+    googleAdsConversionEventId: string
+    workspaceId: string
+    attempt: number
+  }
+}
+
+export type IntegrationJobSendMetaCapiEvent = {
+  type: typeof IntegrationJobAction.sendMetaCapiEvent
+  data: {
+    metaCapiEventId: string
+    workspaceId: string
+  }
+}
+
+/**
+ * `channel`/`integrationId` generalize this beyond WhatsApp (Amendment A1:
+ * Messenger also supports the `templateSent` trigger — see
+ * `apps/worker/src/chat/handlers/send-messenger-template.ts`). Instagram has
+ * no template entity, so `channel` is only ever `"whatsapp"` or `"messenger"`
+ * here in practice, though the type stays the full `AdsConversionChannel` to
+ * match `evaluateTemplateSentInput` 1:1 for a thin pass-through.
+ */
+export type AdsConversionJobEvaluateTemplateSent = {
+  type: typeof IntegrationJobAction.evaluateTemplateSent
+  data: {
+    workspaceId: string
+    channel: AdsConversionChannel
+    integrationId: string
+    contactInboxId: string
+    templateId: string
+  }
+}
+
+/**
+ * Generic conversion-trigger evaluation job shared by every trigger type beyond
+ * templateSent. The occurrence discriminant gives evaluateConversionTrigger
+ * enough context to match each enabled rule's trigger. channel/integrationId
+ * generalize the previous WhatsApp-only field.
+ */
+export type AdsConversionJobEvaluateConversionTrigger = {
+  type: typeof IntegrationJobAction.evaluateConversionTrigger
+  data: {
+    workspaceId: string
+    channel: AdsConversionChannel
+    integrationId: string
+    contactInboxId: string
+    occurrence:
+      | { type: "tagApplied"; tagId: string }
+      | { type: "keywordMatched"; automatedResponseId: string }
+      | { type: "contactReplied"; isFirstReply: boolean }
+  }
+}
+
+/**
+ * channel/integrationMessengerId/integrationInstagramId widen this beyond
+ * WhatsApp, additive next to integrationWhatsappId so an omitted channel keeps
+ * prior callers' behavior unchanged.
+ */
+export type AdsConversionJobSyncRetargetAudience = {
+  type: typeof IntegrationJobAction.syncRetargetAudience
+  data: {
+    workspaceId: string
+    customAudienceId: string
+    segment: "conversations" | "leads" | "purchases"
+    adId?: string | null
+    integrationWhatsappId?: string
+    channel?: AdsConversionChannel
+    integrationMessengerId?: string
+    integrationInstagramId?: string
+    since: string
+    until: string
+  }
+}
+
+export type AdsConversionJobData =
+  | AdsConversionJobSendConversionEvent
+  | AdsConversionJobEvaluateTemplateSent
+  | AdsConversionJobEvaluateConversionTrigger
+  | AdsConversionJobSyncRetargetAudience
+
+/**
+ * Fetches a contact's profile picture from the channel's Graph/API, mirrors
+ * the bytes to our object storage, and persists the storage path on the
+ * Contact row. Dispatched per-contact after Coexist historical sync upserts
+ * contacts (which only carry name/sourceId, not avatar).
+ */
+export type IntegrationJobUpdateContactAvatar = {
+  type: typeof IntegrationJobAction.updateContactAvatar
+  data: {
+    workspaceId: string
+    contactInboxId: string
+    sourceId: string
+  }
+}
+
+export type IntegrationJobProcessCommentAutomation = {
+  type: typeof IntegrationJobAction.processCommentAutomation
+  data: {
+    integrationType: string
+    integrationIdentifier: string
+    workspaceId: string
+    conversationId: string
+    contactInboxId: string
+    commentId: string
+    postId: string
+    parentId?: string
+    fromId: string
+    message?: string
+    tags?: CommentTag[]
+    createdTime: number
+    /**
+     * The comment was made on a live broadcast. Only `post.type: "live"`
+     * automations answer it; an `all` automation skips it (`matchPost`).
+     */
+    isLive?: boolean
+    /**
+     * Run this one automation only — a replayed missed comment must not fire
+     * every other active automation on the channel. Absent on webhook comments.
+     */
+    onlyAutomationId?: string
+    /**
+     * Set when AI moderation already cleared this comment for
+     * `onlyAutomationId`, so the resumed run goes straight to the reply
+     * filters instead of asking the AI again.
+     */
+    moderationChecked?: boolean
+    /**
+     * The run belongs to a missed-comment replay. Set on the payload the AI
+     * moderation job carries, so it and the resumed run keep the replay's low
+     * priority after leaving the replay's async context.
+     */
+    replay?: boolean
+  }
+}
+
+/**
+ * TikTok flagged a comment as high intent, which is the only way to obtain a
+ * `comment_id` its Comment-to-Message DM will accept.
+ *
+ * Deliberately thin: the event carries no post id, so the handler's whole job is
+ * to stamp the flag onto the comment already ingested from `comment.update` and
+ * let the automation path read it. Nothing here identifies an automation.
+ */
+export type IntegrationJobTiktokHighIntentComment = {
+  type: typeof IntegrationJobAction.tiktokHighIntentComment
+  data: {
+    integrationType: string
+    integrationIdentifier: string
+    commentId: string
+    commentText?: string
+    uniqueIdentifier?: string
+    isFollower?: boolean
+    /** Epoch seconds — when the comment was written, not when it was flagged. */
+    commentedAt: number
+  }
+}
+
+/**
+ * A private reply the automation matched but could not send yet, because the
+ * channel only permits a DM once it has flagged the comment high intent and
+ * that flag had not arrived.
+ *
+ * Carries the whole candidate rather than a row id. The automation pass is the
+ * only place that knows which automation matched, and re-deriving it later
+ * would re-run `replyOncePerUserPerPost` against the dedup row this very
+ * comment just wrote — declining every time. The job re-checks the flag on a
+ * bounded schedule and either sends or records one blocked event.
+ */
+export type IntegrationJobDeferredCommentPrivateReply = {
+  type: typeof IntegrationJobAction.deferredCommentPrivateReply
+  data: {
+    integrationType: string
+    integrationIdentifier: string
+    workspaceId: string
+    automationId: string
+    channelType:
+      | "messenger"
+      | "instagram"
+      | "instagramFacebook"
+      | "threads"
+      | "tiktok"
+    commentId: string
+    postId: string
+    conversationId: string
+    contactInboxId: string
+    message?: string
+    /** Epoch seconds, as `processCommentAutomation` received it. */
+    createdTime: number
+    /** ISO-8601; the `occurredAt` every analytics row for this comment shares. */
+    occurredAtIso: string
+    privateReply: CommentReply
+    dedup?: {
+      automationId: string
+      contactId: string
+      postId: string
+      workspaceId: string
+    }
+    /**
+     * The automation's `replyAfter`, in ms, exactly as the inline path received
+     * it. Optional because jobs enqueued before this field existed are still in
+     * flight; the handler reads it as `?? 0`, which is what they did anyway.
+     *
+     * The handler spends what is LEFT of it, not the whole thing — the deferral
+     * wait already ran down part of the clock.
+     */
+    delay?: number
+    /** Index into the handler's re-check schedule; 0 on the first enqueue. */
+    attempt: number
+  }
+}
+
+export type IntegrationJobCommentAIReply = {
+  type: typeof IntegrationJobAction.commentAIReply
+  data: {
+    integrationType: string
+    integrationIdentifier: string
+    workspaceId: string
+    conversationId: string
+    contactInboxId: string
+    commentId: string
+    agentId: string
+    replyChannel: "public" | "private"
+    channelType:
+      | "messenger"
+      | "instagram"
+      | "instagramFacebook"
+      | "threads"
+      | "tiktok"
+    message?: string
+    parentMessageId?: string | null
+    parentMessageCreatedAt?: string | null
+  }
+}
+
+export type IntegrationJobProcessStoryReplyAutomation = {
+  type: typeof IntegrationJobAction.processStoryReplyAutomation
+  data: {
+    workspaceId: string
+    conversationId: string
+    contactInboxId: string
+    messageId: string
+    storyId: string
+    storyUrl?: string
+    message?: string
+    channelType: "instagram" | "instagramFacebook"
+  }
+}
+
+export type IntegrationJobCaptureTemplateFlowResponse = {
+  type: typeof IntegrationJobAction.captureTemplateFlowResponse
+  data: {
+    workspaceId: string
+    conversationId: string | ConversationModel
+    contactInboxId: string | ContactInboxModel
+    messageId: string
+    templateFlowToken: string
+    flowResponse: Record<string, unknown>
+    /** Stored files of the response's file answers, by response key. */
+    flowFiles?: Record<string, ResolvedFlowFile[]>
+  }
+}
+
+/**
+ * A cart a contact sent from a chat catalog: it becomes their shop cart and
+ * the bot answers with a summary and a CHECK OUT button. One job per message
+ * (`getInboundCartReplyJobId`), so a redelivered webhook answers once.
+ */
+export type IntegrationJobReplyToInboundCart = {
+  type: typeof IntegrationJobAction.replyToInboundCart
+  data: {
+    workspaceId: string
+    conversationId: string
+    contactId: string
+    contactInboxId: string
+    messageId: string
+    cart: MessageInboundOrderEntity
+  }
+}
+
+export const getInboundCartReplyJobId = (messageId: string): string =>
+  `inbound-cart-reply-${messageId}`
+
+/**
+ * A signed Stripe or PayPal webhook about one web shop payment attempt. The
+ * job asks the provider again and settles the order; one job per provider
+ * event (`getOrderPaymentEventJobId`), so a redelivered webhook runs once.
+ */
+export type IntegrationJobConfirmOrderPayment = {
+  type: typeof IntegrationJobAction.confirmOrderPayment
+  data: {
+    provider: "stripe" | "paypal"
+    workspaceId: string
+    /** The Checkout Session (Stripe) or order (PayPal) id. */
+    reference: string
+    /** What ChatbotX put on the attempt; null for one it did not create. */
+    metadata: {
+      workspaceId: string
+      orderId: string
+      orderPaymentId: string
+    } | null
+  }
+}
+
+export const getOrderPaymentEventJobId = (
+  provider: string,
+  eventId: string,
+): string => `order-payment-event-${provider}-${eventId}`
+
+/**
+ * Pulls the connected Shopify store's catalog and recent orders again. Only
+ * one runs per workspace: `IntegrationShopify.syncStatus` is claimed before
+ * the job is queued.
+ */
+export type IntegrationJobShopifySync = {
+  type: typeof IntegrationJobAction.shopifySync
+  data: {
+    workspaceId: string
+    scope: "all" | "products" | "orders"
+  }
+}
+
+/** Completed jobs are kept, so each requested sync carries its own key. */
+export const getShopifySyncJobId = (
+  workspaceId: string,
+  scope: string,
+  requestedAt: Date,
+) => `shopify-sync-${workspaceId}-${scope}-${requestedAt.getTime()}`
+
+/**
+ * A signed Shopify webhook. Only the topic and the object's id travel: the
+ * handler reads the object back from Shopify, so a late or reordered
+ * delivery still writes the store's current state.
+ */
+export type IntegrationJobShopifyWebhook = {
+  type: typeof IntegrationJobAction.shopifyWebhook
+  data: {
+    workspaceId: string
+    /** Shopify's REST spelling, e.g. `orders/create`. */
+    topic: string
+    /** The object's GID; null for `app/uninstalled`. */
+    objectId: string | null
+  }
+}
+
+/** One job per delivery, so a redelivered webhook runs once. */
+export const getShopifyWebhookJobId = (webhookId: string) =>
+  `shopify-webhook-${webhookId}`
+
+/**
+ * Pulls the connected WooCommerce store's catalog and recent orders again.
+ * Only one runs per workspace: `IntegrationWoocommerce.syncStatus` is claimed
+ * before the job is queued.
+ */
+export type IntegrationJobWoocommerceSync = {
+  type: typeof IntegrationJobAction.woocommerceSync
+  data: {
+    workspaceId: string
+    scope: "all" | "products" | "orders"
+  }
+}
+
+/** Completed jobs are kept, so each requested sync carries its own key. */
+export const getWoocommerceSyncJobId = (
+  workspaceId: string,
+  scope: string,
+  requestedAt: Date,
+) => `woocommerce-sync-${workspaceId}-${scope}-${requestedAt.getTime()}`
+
+/**
+ * A signed WooCommerce webhook. Only the topic and the object's id travel:
+ * the handler reads the object back from the store, so a late or reordered
+ * delivery still writes the store's current state.
+ */
+export type IntegrationJobWoocommerceWebhook = {
+  type: typeof IntegrationJobAction.woocommerceWebhook
+  data: {
+    workspaceId: string
+    /** WooCommerce's spelling, e.g. `order.updated`. */
+    topic: string
+    /** The product, order or coupon id the delivery is about. */
+    resourceId: string
+  }
+}
+
+/** One job per delivery, so a redelivered webhook runs once. */
+export const getWoocommerceWebhookJobId = (deliveryId: string) =>
+  `woocommerce-webhook-${deliveryId}`
+
+/**
+ * Facebook Lead Ads: a page leadgen webhook. Carries only ids — the handler
+ * resolves the page's Messenger inbox + token, fetches the lead's answers, then
+ * finds/creates the contact by PSID and applies the matched automation.
+ */
+export type IntegrationJobProcessLeadgen = {
+  type: typeof IntegrationJobAction.processLeadgen
+  data: {
+    integrationType: string
+    integrationIdentifier: string
+    leadgenId: string
+    formId: string
+    adgroupId?: string
+  }
+}
+
+/**
+ * A raw `marketing_message_*` Page webhook change. Parsed in the worker.
+ */
+export type IntegrationJobProcessMarketingMessageWebhook = {
+  type: typeof IntegrationJobAction.processMarketingMessageWebhook
+  data: { pageId: string; field: string; value: unknown }
+}
+
+/**
+ * Runs one budgeted chunk of an Automatic Customer Scan run. Only carries
+ * `runId`/`workspaceId` — channel, integration, and inbox are read off the
+ * claimed run row instead of the payload, so a stale/forged job can't steer
+ * the engine at another channel or workspace.
+ */
+export type IntegrationJobContactScan = {
+  type: typeof IntegrationJobAction.contactScan
+  data: {
+    runId: string
+    workspaceId: string
+  }
+}
+
+/**
+ * Runs one budgeted chunk of a Meta Business AI bulk (enable / disable for all
+ * customers) run. Only `runId`/`workspaceId` travel: the action, message and
+ * cursor are read off the claimed run row, so a stale or forged job cannot
+ * steer the engine.
+ */
+export type IntegrationJobAiHandoverBulkToggle = {
+  type: typeof IntegrationJobAction.aiHandoverBulkToggle
+  data: {
+    runId: string
+    workspaceId: string
+  }
+}
+
+/**
+ * Runs one budgeted chunk of a contact sync run. Only `runId`/`workspaceId`
+ * travel: sources, options and cursors are read off the claimed run row, so a
+ * stale or forged job cannot steer the engine.
+ */
+export type IntegrationJobContactSync = {
+  type: typeof IntegrationJobAction.contactSync
+  data: {
+    runId: string
+    workspaceId: string
+  }
+}
+
+/**
+ * One conversation-routing webhook item (handover, standby message or echo).
+ * The channel decides what `payload` means; the worker only forwards it.
+ * Same data shape as {@link IntegrationJobReceiveMessage}.
+ */
+export type IntegrationJobThreadControlEvent = {
+  type: typeof IntegrationJobAction.threadControlEvent
+  data: IntegrationJobReceiveMessage["data"]
+}
+
+/**
+ * Releases a thread this app owns (archive auto-release). `jobId` is
+ * `thread-release-<contactInboxId>-<updatedAtMs>`, so a re-archive of the same
+ * thread state collapses onto one job.
+ */
+export type IntegrationJobThreadControlAction = {
+  type: typeof IntegrationJobAction.threadControlAction
+  data: {
+    workspaceId: string
+    contactInboxId: string
+    /** The conversation the divider is written to (the archived one). */
+    conversationId: string
+    action: "release"
+    /**
+     * `threadControlUpdatedAt` (ISO) of the owned thread when the job was
+     * enqueued; the release is skipped when it has advanced since. `null` =
+     * the row carried none; absent = a job queued before this field existed
+     * (released on the owned check alone).
+     */
+    threadControlUpdatedAt?: string | null
+  }
+}
+
+/**
+ * Takes a thread back from the AI agent when a customer message reached the
+ * AI-owned thread while the workspace's AI automation is not running, then
+ * replays that message so the bot answers it. One job per stored message
+ * (`ai-takeback-<messageId>`): redeliveries and retries collapse onto it.
+ */
+export type IntegrationJobAiHandoverTakeBack = {
+  type: typeof IntegrationJobAction.aiHandoverTakeBack
+  data: {
+    workspaceId: string
+    /** The Page whose AI hand-over settings decide whether the take-back applies. */
+    inboxId: string
+    integrationType: string
+    integrationIdentifier: string
+    contactInboxId: string
+    conversationId: string
+    /** The stored standby copy of the customer's message. */
+    messageId: string
+    /** The channel's AI-agent app id, to recognise a thread taken from it. */
+    aiAgentAppId: string
+    /**
+     * `threadControlUpdatedAt` (ISO) of the thread when this was queued; the
+     * take only applies while it is still that version. `null` = it carried none.
+     */
+    threadControlUpdatedAt: string | null
+    /** The same message as a regular (owner) delivery, replayed after the take. */
+    ownerReplayPayload: unknown
+  }
+}
+
+export type IntegrationJobData =
+  | IntegrationJobReceiveMessage
+  | IntegrationJobReceiveMessageEcho
+  | IntegrationJobReceiveComment
+  | IntegrationJobUpdateIncomingComment
+  | IntegrationJobDeleteIncomingComment
+  | IntegrationJobDeleteIncomingMessage
+  | IntegrationJobUpdateIncomingMessage
+  | IntegrationJobMessageReaction
+  | IntegrationJobMessageStatus
+  | IntegrationJobRecordEmailTrackingTransition
+  | IntegrationJobRunFlowNode
+  | IntegrationJobResumeHeavyStep
+  | IntegrationJobSendFlowPostback
+  | IntegrationJobSendFlowQuickReply
+  | IntegrationJobAgentMarkAsRead
+  | IntegrationJobContactMarkAsRead
+  | IntegrationJobRunRef
+  | IntegrationJobRunChallenge
+  | IntegrationJobResumeWait
+  | IntegrationJobResumeFollowUp
+  | IntegrationJobResumeQuickReplyFollowUp
+  | IntegrationJobResumeStepInputTimeout
+  | IntegrationJobResolveStepInput
+  | IntegrationJobCreateMessage
+  | IntegrationJobProcessAutomatedResponse
+  | IntegrationJobSendSequenceFlow
+  | IntegrationJobCoexistWhatsappBuffer
+  | IntegrationJobCoexistWhatsappFlush
+  | IntegrationJobCoexistMessengerSync
+  | IntegrationJobPollSmtpInbox
+  | IntegrationJobCoexistInstagramSync
+  | IntegrationJobCoexistAttachmentDownload
+  | IntegrationJobAdsAutomaticEvent
+  | IntegrationJobProviderAccountEvent
+  | IntegrationJobWhatsappIdentityChange
+  | IntegrationJobWhatsappCallEvent
+  | IntegrationJobWhatsappCallRecordingReady
+  | IntegrationJobWhatsappCallNativeRecordingFetch
+  | IntegrationJobWhatsappCallNativeTranscriptFetch
+  | IntegrationJobUpdateContactAvatar
+  | IntegrationJobChannelLabelChange
+  | IntegrationJobProcessCommentAutomation
+  | IntegrationJobTiktokHighIntentComment
+  | IntegrationJobDeferredCommentPrivateReply
+  | IntegrationJobCommentAIReply
+  | IntegrationJobProcessLeadgen
+  | IntegrationJobProcessMarketingMessageWebhook
+  | IntegrationJobProcessStoryReplyAutomation
+  | IntegrationJobCaptureTemplateFlowResponse
+  | IntegrationJobReplyToInboundCart
+  | IntegrationJobConfirmOrderPayment
+  | IntegrationJobShopifySync
+  | IntegrationJobShopifyWebhook
+  | IntegrationJobWoocommerceSync
+  | IntegrationJobWoocommerceWebhook
+  | AdsConversionJobSendConversionEvent
+  | IntegrationJobSendMetaCapiEvent
+  | IntegrationJobSendGoogleAdsConversion
+  | AdsConversionJobEvaluateTemplateSent
+  | AdsConversionJobEvaluateConversionTrigger
+  | AdsConversionJobSyncRetargetAudience
+  | IntegrationJobContactScan
+  | IntegrationJobThreadControlEvent
+  | IntegrationJobThreadControlAction
+  | IntegrationJobAiHandoverTakeBack
+  | IntegrationJobAiHandoverBulkToggle
+  | IntegrationJobContactSync
+  | IntegrationJobChannelAudienceEvent
+
+export const integrationQueue = isNoRedisEnv()
+  ? fakeQueue
+  : new Queue<IntegrationJobData>(queueNames.enum.integration, {
+      connection: getQueueConnection(queueNames.enum.integration),
+      defaultJobOptions,
+    })
+
+// Ads-conversion jobs need a stronger retry policy than the queue default since
+// CAPI sends and retarget syncs call out to Meta and should ride out transient
+// 5xx/429s over minutes. sendConversionEvent also gets a BullMQ priority so
+// it's picked ahead of the other 3 ads actions — note BullMQ processes
+// unprioritized jobs before any prioritized one, so this only orders ads-
+// conversion jobs relative to each other.
+const CAPI_EVENT_PRIORITY = 1
+
+const adsConversionRetryOptions: JobsOptions = {
+  attempts: 5,
+  backoff: {
+    type: "exponential",
+    delay: 30_000,
+  },
+}
+
+/**
+ * The native recording/transcript fetch jobs can be enqueued before the
+ * WhatsappCall row exists (racing the row-creating webhook/job). The handler
+ * throws a retryable error while it's missing; this bounds retries to roughly
+ * an hour rather than the default short-lived policy.
+ */
+const NATIVE_CALL_CAPTURE_RETRY_OPTIONS: JobsOptions = {
+  attempts: 13,
+  backoff: {
+    type: "fixed",
+    delay: 300_000,
+  },
+}
+
+const jobOptionsByAction: Partial<
+  Record<IntegrationJobActionValue, JobsOptions>
+> = {
+  [IntegrationJobAction.evaluateTemplateSent]: adsConversionRetryOptions,
+  [IntegrationJobAction.evaluateConversionTrigger]: adsConversionRetryOptions,
+  [IntegrationJobAction.sendConversionEvent]: {
+    ...adsConversionRetryOptions,
+    priority: CAPI_EVENT_PRIORITY,
+  },
+  [IntegrationJobAction.sendMetaCapiEvent]: adsConversionRetryOptions,
+  [IntegrationJobAction.sendGoogleAdsConversion]: adsConversionRetryOptions,
+  [IntegrationJobAction.syncRetargetAudience]: adsConversionRetryOptions,
+  // The repair re-runs a short DB transaction after the original attempt
+  // failed, typically because the database was briefly unavailable.
+  [IntegrationJobAction.recordEmailTrackingTransition]:
+    adsConversionRetryOptions,
+  [IntegrationJobAction.whatsappCallNativeRecordingFetch]:
+    NATIVE_CALL_CAPTURE_RETRY_OPTIONS,
+  [IntegrationJobAction.whatsappCallNativeTranscriptFetch]:
+    NATIVE_CALL_CAPTURE_RETRY_OPTIONS,
+}
+
+/**
+ * Bookkeeping ingress that is consumed by the `low` worker so it never queues
+ * ahead of a customer reply.
+ */
+export type LowRoutedIntegrationJob =
+  | IntegrationJobMessageStatus
+  | IntegrationJobContactMarkAsRead
+  | IntegrationJobReceiveMessageEcho
+
+/**
+ * Whether a job goes to the `low` queue. A new bookkeeping action joins with a
+ * case here and a variant in `LowRoutedIntegrationJob`.
+ */
+const isLowRoutedIntegrationJob = (
+  job: IntegrationJobData,
+): job is LowRoutedIntegrationJob => {
+  switch (job.type) {
+    case IntegrationJobAction.messageStatus:
+      // A status that may continue a flow stays with live traffic.
+      return job.data.continuesFlow !== true
+    case IntegrationJobAction.contactMarkAsRead:
+    case IntegrationJobAction.incomingMessageEcho:
+      return true
+    default:
+      return false
+  }
+}
+
+/**
+ * Enqueue helper that layers per-action retry/priority defaults
+ * (`jobOptionsByAction`) under the caller's own opts, and routes the
+ * bookkeeping actions of `isLowRoutedIntegrationJob` to the `low` queue. Producer
+ * opts — most importantly a deterministic `jobId` — MUST win, so they're
+ * merged last; BullMQ itself also treats `jobId` as authoritative regardless
+ * of merge order, but keeping the spread order explicit avoids relying on that.
+ */
+export const enqueueIntegrationJob = (
+  job: IntegrationJobData,
+  opts?: JobsOptions,
+) => {
+  const options: JobsOptions = { ...jobOptionsByAction[job.type], ...opts }
+  return isLowRoutedIntegrationJob(job)
+    ? lowQueue.add(job.type, job, options)
+    : integrationQueue.add(job.type, job, options)
+}

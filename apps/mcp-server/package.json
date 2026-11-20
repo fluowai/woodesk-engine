@@ -1,0 +1,70 @@
+{
+  "name": "chatbotx-mcp",
+  "version": "0.0.0-dev",
+  "description": "MCP Server for ChatbotX — gives AI agents access to your ChatbotX workspace via the Model Context Protocol",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ChatbotXIO/ChatbotX.git",
+    "directory": "apps/mcp-server"
+  },
+  "keywords": [
+    "mcp",
+    "chatbotx",
+    "ai",
+    "model-context-protocol"
+  ],
+  "license": "ISC",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "bin": {
+    "chatbotx-mcp": "dist/index.mjs"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsdown && node scripts/verify-packaged-guides.mjs",
+    "check-types": "tsc --noEmit",
+    "dev:mcp": "dotenv -e ../../.env -e .env -- tsx --watch src/index.ts",
+    "prepublishOnly": "node --input-type=commonjs -e \"const v=require('./package.json').version; if (v === '0.0.0-dev') { console.error('chatbotx-mcp: version is the 0.0.0-dev placeholder — publish via .github/workflows/publish-chatbotx-mcp.yml'); process.exit(1) }\"",
+    "start": "node dist/index.mjs",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest",
+    "eval:business": "tsx evals/run.ts",
+    "eval:search": "tsx evals/search-audit.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.0",
+    "@t3-oss/env-core": "catalog:",
+    "dotenv": "^17.4.2",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@ai-sdk/openai": "catalog:",
+    "@chatbotx.io/flow-config": "workspace:*",
+    "@chatbotx.io/logger": "workspace:*",
+    "@chatbotx.io/vitest-config": "workspace:*",
+    "@orpc/zod": "^1.15.4",
+    "@types/node": "catalog:",
+    "ai": "catalog:",
+    "dotenv-cli": "catalog:",
+    "tsdown": "catalog:",
+    "tsx": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

@@ -1,0 +1,218 @@
+import { trackingResponseTypes } from "@chatbotx.io/analytics"
+import {
+  adsConversionService,
+  contactActivityService,
+} from "@chatbotx.io/business"
+import { enqueueLeaderboardAward } from "@chatbotx.io/business/leaderboard"
+import { db } from "@chatbotx.io/database/client"
+import type { FileType } from "@chatbotx.io/database/partials"
+import type {
+  AutomatedResponseModel,
+  ContactInboxModel,
+  ConversationModel,
+} from "@chatbotx.io/database/types"
+import { webhookChannelOrigin } from "@chatbotx.io/events/context"
+import { createdAtFromId } from "@chatbotx.io/utils"
+import { applySpintax } from "@chatbotx.io/utils/spintax"
+import { contactVariableService } from "@chatbotx.io/variables"
+import {
+  ChatJobAction,
+  chatQueue,
+  IntegrationJobAction,
+  integrationQueue,
+} from "@chatbotx.io/worker-config"
+import { ruleMatchesMessage } from "./keyword-match"
+
+/** Channels whose leaderboards offer the "keywords" rule. */
+const KEYWORD_LEADERBOARD_CHANNELS = new Set([
+  "messenger",
+  "instagram",
+  "tiktok",
+])
+
+/**
+ * Leaderboard "keywords" rule: an inbound message that matches ANY Keywords
+ * rule scores once, whatever the rule then sends. The trigger message is the
+ * source event (its id is the sourceRef and the time packed in that id the
+ * event time), so re-processing the same message never scores twice.
+ */
+const awardKeywordLeaderboard = async (props: {
+  conversation: ConversationModel
+  contactInbox: ContactInboxModel
+  messageId: string
+}): Promise<void> => {
+  if (!KEYWORD_LEADERBOARD_CHANNELS.has(props.contactInbox.channel)) {
+    return
+  }
+  const eventAt = createdAtFromId(props.messageId)
+  if (!eventAt) {
+    return
+  }
+  await enqueueLeaderboardAward({
+    workspaceId: props.conversation.workspaceId,
+    contactId: props.contactInbox.contactId,
+    inboxId: props.contactInbox.inboxId,
+    rule: "keywords",
+    sourceRef: props.messageId,
+    eventAt,
+  })
+}
+
+/**
+ * Records the "keyword received" activity and the matched message text for the
+ * rule that is about to be dispatched. Only inbound-type rules count (an
+ * outbound/Page rule is not something the contact said). Called right before
+ * the dispatch side effect, so a failure throws and the job retries without
+ * having sent anything; the message id makes the retry a no-op.
+ */
+const recordKeywordReceived = async (props: {
+  conversation: ConversationModel
+  contactInbox: ContactInboxModel
+  messageId: string
+  rule: Pick<AutomatedResponseModel, "id" | "type">
+  text: string
+}): Promise<void> => {
+  if (props.rule.type !== "inbound") {
+    return
+  }
+  await contactActivityService.recordKeywordMatch({
+    automatedResponseId: props.rule.id,
+    contactId: props.contactInbox.contactId,
+    messageId: props.messageId,
+    occurredAt: createdAtFromId(props.messageId) ?? new Date(),
+    text: props.text,
+    workspaceId: props.conversation.workspaceId,
+  })
+}
+
+export const dispatchAutomatedResponseReply = async (props: {
+  conversation: ConversationModel
+  contactInbox: ContactInboxModel
+  messageId: string
+  text: string
+  rules: Pick<
+    AutomatedResponseModel,
+    "id" | "keywords" | "conditions" | "flowId" | "text" | "type"
+  >[]
+  /** File types attached to the trigger message (image/video/audio conditions). */
+  attachmentFileTypes?: readonly FileType[]
+  triggerType: string
+  /** The rule fired for a contact's inbound message (not an outbound echo). */
+  startedByContactMessage?: boolean
+}): Promise<boolean> => {
+  const { conversation, contactInbox, messageId, text, rules, triggerType } =
+    props
+  let keywordAwarded = false
+
+  for (const rule of rules) {
+    // Contact rules match on their `conditions`; Page rules (and Contact
+    // rules without conditions) keep the mode derived from `rule.type` — see
+    // `automatedResponseFolderTypeByType`.
+    const matched = ruleMatchesMessage(rule, {
+      text,
+      attachmentFileTypes: props.attachmentFileTypes ?? [],
+    })
+
+    if (!matched) {
+      continue
+    }
+
+    if (rule.type === "inbound" && !keywordAwarded) {
+      keywordAwarded = true
+      await awardKeywordLeaderboard({ conversation, contactInbox, messageId })
+    }
+
+    // Ads conversion `keywordMatched` trigger: only inbound-type rules
+    // (invariant — never outbound, e.g. replyByOutboundAutomatedResponse)
+    // and only on WhatsApp, where CTWA attribution exists.
+    if (
+      rule.type === "inbound" &&
+      adsConversionService.isEligibleChannel(contactInbox.channel)
+    ) {
+      await adsConversionService.enqueueKeywordMatchedEvaluation({
+        workspaceId: conversation.workspaceId,
+        channel: contactInbox.channel,
+        inboxId: contactInbox.inboxId,
+        contactInboxId: contactInbox.id,
+        automatedResponseId: rule.id,
+        messageId,
+      })
+    }
+
+    if (rule.flowId) {
+      const flow = await db.query.flowModel.findFirst({
+        where: {
+          id: rule.flowId,
+          currentVersionId: { isNotNull: true },
+        },
+      })
+      if (flow) {
+        await recordKeywordReceived({
+          conversation,
+          contactInbox,
+          messageId,
+          rule,
+          text,
+        })
+        await integrationQueue.add(IntegrationJobAction.sendFlow, {
+          type: IntegrationJobAction.sendFlow,
+          data: {
+            conversationId: conversation.id,
+            contactInboxId: contactInbox.id,
+            flowId: flow.id,
+            startedByContactMessage: props.startedByContactMessage,
+            trackingContext: {
+              aiProvider: "none",
+              messageId,
+              conversationId: conversation.id,
+              responseType: trackingResponseTypes.enum.automated_response,
+              startTime: Date.now(),
+              triggerType,
+              workspaceId: conversation.workspaceId,
+            },
+            origin: webhookChannelOrigin(),
+          },
+        })
+        return true
+      }
+    } else if (rule.text) {
+      await recordKeywordReceived({
+        conversation,
+        contactInbox,
+        messageId,
+        rule,
+        text,
+      })
+      const variables = await contactVariableService.getAll({
+        contactId: conversation.contactId,
+        contactInbox,
+        conversation,
+      })
+      // Spun before the variable pass: a keyword rule's text is author copy,
+      // while the contact data substituted into it is not and must ship as-is.
+      const stepMessage = await contactVariableService.replaceAll({
+        text: applySpintax(rule.text),
+        variables,
+      })
+      await chatQueue.add(ChatJobAction.sendChatMessage, {
+        type: ChatJobAction.sendChatMessage,
+        data: {
+          conversation,
+          text: stepMessage,
+          trackingContext: {
+            aiProvider: "none",
+            conversationId: conversation.id,
+            messageId,
+            responseType: trackingResponseTypes.enum.automated_response,
+            startTime: Date.now(),
+            triggerType,
+            workspaceId: conversation.workspaceId,
+          },
+        },
+      })
+      return true
+    }
+  }
+
+  return false
+}

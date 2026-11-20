@@ -1,0 +1,106 @@
+import {
+  decisionFlowOriginSchema,
+  extractContactInboxId,
+} from "@chatbotx.io/events"
+import { runWithWebhookExecutionContext } from "@chatbotx.io/events/context"
+import { SdkException } from "@chatbotx.io/sdk"
+import {
+  queueNames,
+  TriggerJobAction,
+  type TriggerJobData,
+} from "@chatbotx.io/worker-config"
+import type { Job } from "bullmq"
+import { createQueueWorker } from "../lib/create-queue-worker"
+import { isBlockedWorkspace } from "../lib/is-blocked-workspace"
+import { logger } from "../lib/logger"
+import { resolveWorkspaceId } from "../lib/resolve-workspace-id"
+import { runJobWithAuditContext } from "../lib/run-job-with-audit-context"
+import { runWorker } from "../lib/shutdown"
+import { TriggerExecutorService } from "./services/trigger-executor.service"
+import { TriggerMatcherService } from "./services/trigger-matcher.service"
+import type { TriggerEventData } from "./types"
+
+const triggerMatcher = new TriggerMatcherService()
+const triggerExecutor = new TriggerExecutorService()
+
+function startTriggerWorker() {
+  const worker = createQueueWorker(
+    queueNames.enum.trigger,
+    async (job: Job<TriggerJobData>) => {
+      const workspaceId = await resolveWorkspaceId(job.data.data)
+      if (await isBlockedWorkspace(workspaceId)) {
+        return
+      }
+
+      await runJobWithAuditContext(
+        { workspaceId, source: "trigger:evaluateTriggers" },
+        async () => {
+          switch (job.data.type) {
+            case TriggerJobAction.evaluateTriggers: {
+              const { data: eventData } = job.data
+
+              if (eventData.source === "worker") {
+                logger.info("Skipping worker-emitted event to prevent loop")
+                return
+              }
+
+              const matchedTriggers = await triggerMatcher.findMatchingTriggers(
+                eventData as TriggerEventData,
+              )
+
+              if (matchedTriggers.length === 0) {
+                return
+              }
+
+              logger.info(
+                `Found ${matchedTriggers.length} triggers for event type ${eventData.eventType}`,
+              )
+
+              const contactInboxId = extractContactInboxId(eventData.eventData)
+              const conversationId =
+                typeof eventData.eventData.conversationId === "string"
+                  ? eventData.eventData.conversationId
+                  : undefined
+              const decisionFlowOrigin = decisionFlowOriginSchema.safeParse(
+                eventData.eventData?.decisionFlowOrigin,
+              )
+
+              await runWithWebhookExecutionContext(
+                eventData.channelOriginated ? { source: "webhook" } : {},
+                () =>
+                  Promise.allSettled(
+                    matchedTriggers.map((trigger) =>
+                      triggerExecutor.execute(trigger, {
+                        contactId: eventData.contactId,
+                        contactInboxId,
+                        conversationId,
+                        decisionFlowOrigin: decisionFlowOrigin.success
+                          ? decisionFlowOrigin.data
+                          : undefined,
+                        occurrenceId: job.id
+                          ? `${job.id}:${job.timestamp}`
+                          : undefined,
+                      }),
+                    ),
+                  ),
+              )
+              return
+            }
+
+            default:
+              throw new SdkException("TriggerJobAction action is not defined")
+          }
+        },
+      )
+    },
+    { concurrency: 100 },
+  )
+
+  worker.on("completed", (job) => {
+    logger.debug(`Trigger job ${job.id} completed successfully`)
+  })
+
+  logger.info("Trigger worker started")
+}
+
+runWorker("trigger", startTriggerWorker)

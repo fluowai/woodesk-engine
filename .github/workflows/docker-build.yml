@@ -1,0 +1,78 @@
+name: Build and Publish Woodesk Engine Docker Images
+
+on:
+  workflow_dispatch: # Permite disparar manualmente com 1 clique na aba Actions
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - '.gitignore'
+      - 'docs/**'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-push:
+    name: Build & Push ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: woodesk-builder
+            dockerfile: ./apps/builder/docker/Dockerfile
+            swap: true
+          - name: woodesk-worker
+            dockerfile: ./apps/worker/docker/Dockerfile
+            swap: false
+          - name: woodesk-realtime
+            dockerfile: ./apps/realtime/docker/Dockerfile
+            swap: false
+          - name: woodesk-sandbox
+            dockerfile: ./apps/javascript-executor/docker/Dockerfile
+            swap: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Add swap space (para compilação do Next.js/Builder)
+        if: matrix.swap == true
+        continue-on-error: true
+        run: |
+          sudo fallocate -l 10G /swapfile || true
+          sudo chmod 600 /swapfile || true
+          sudo mkswap /swapfile || true
+          sudo swapon /swapfile || true
+          free -h
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase repository owner
+        id: repo_owner
+        run: echo "owner_lc=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.repo_owner.outputs.owner_lc }}/${{ matrix.name }}:latest
+            ${{ env.REGISTRY }}/${{ steps.repo_owner.outputs.owner_lc }}/${{ matrix.name }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
